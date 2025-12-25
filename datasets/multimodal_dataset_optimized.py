@@ -423,18 +423,30 @@ class MultiModalHydroDatasetOptimized(Dataset):
         img_seq: np.ndarray,
         modality: str
     ) -> np.ndarray:
-        """Normalize image sequence (land pixels only)"""
-        img_norm = img_seq.copy()
-        land_mask = self.stats['land_mask'].numpy()
+        """
+        Normalize image sequence (land pixels only) - VECTORIZED VERSION
 
+        Args:
+            img_seq: [T, H, W] numpy array
+            modality: str (precip/soil/temp)
+
+        Returns:
+            img_norm: [T, H, W] normalized array
+        """
         mean = self.stats[f'{modality}_mean'].item()
         std = self.stats[f'{modality}_std'].item()
+        land_mask = self.stats['land_mask'].numpy()  # [H, W]
 
-        for t in range(img_seq.shape[0]):
-            img_norm[t][land_mask == 1] = (
-                (img_seq[t][land_mask == 1] - mean) / (std + 1e-8)
-            )
-            img_norm[t][land_mask == 0] = 0.0
+        # Vectorized normalization (no loop!)
+        # Broadcast land_mask from [H, W] to [T, H, W]
+        mask_3d = (land_mask == 1)[np.newaxis, :, :]  # [1, H, W]
+
+        # Apply normalization to all time steps at once using np.where
+        img_norm = np.where(
+            mask_3d,
+            (img_seq - mean) / (std + 1e-8),
+            0.0
+        ).astype(np.float32)
 
         return img_norm
 
