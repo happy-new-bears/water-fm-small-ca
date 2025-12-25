@@ -401,18 +401,20 @@ class MultiModalHydroDatasetOptimized(Dataset):
     def _build_valid_samples(
         self,
         riverflow_data: np.ndarray
-    ) -> List[Tuple[int, int]]:
-        """Build valid sample indices"""
+    ) -> List[int]:
+        """
+        Build valid sample indices (time windows only)
+
+        Each sample is a time window containing ALL catchments.
+        No per-catchment duplication.
+
+        Returns:
+            List of day indices for valid time windows
+        """
         valid_samples = []
 
-        for catch_idx in range(self.num_catchments):
-            for day_idx in range(0, self.num_days - self.max_sequence_length + 1, self.stride):
-                # Check riverflow for NaNs
-                window = riverflow_data[catch_idx, day_idx:day_idx + self.max_sequence_length]
-                if np.isnan(window).any():
-                    continue
-
-                valid_samples.append((catch_idx, day_idx))
+        for day_idx in range(0, self.num_days - self.max_sequence_length + 1, self.stride):
+            valid_samples.append(day_idx)
 
         return valid_samples
 
@@ -463,11 +465,10 @@ class MultiModalHydroDatasetOptimized(Dataset):
                 'catchment_padding_mask': [num_patches, patch_size],
                 'num_patches': int,
                 'patch_size': int,
-                'catchment_id': int,  # IMPORTANT: Add this for collate!
                 'start_date': datetime,
             }
         """
-        catchment_idx, start_day_idx = self.valid_samples[idx]
+        start_day_idx = self.valid_samples[idx]
         end_day_idx = start_day_idx + self.max_sequence_length
 
         # 1. Image data: Direct slicing (super fast!)
@@ -529,6 +530,5 @@ class MultiModalHydroDatasetOptimized(Dataset):
             'catchment_padding_mask': padding_mask,
             'num_patches': self.num_patches,
             'patch_size': self.patch_size,
-            'catchment_id': int(self.catchment_ids[catchment_idx]),  # IMPORTANT: Add this!
             'start_date': self.date_list[start_day_idx],
         }

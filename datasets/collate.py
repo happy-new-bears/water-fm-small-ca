@@ -200,9 +200,6 @@ class MultiScaleMaskedCollate:
         ])  # [B, num_patches, patch_size]
 
         # Metadata
-        batch_dict['catchment_ids'] = torch.tensor([
-            s['catchment_id'] for s in truncated_batch
-        ], dtype=torch.long)
         batch_dict['seq_len'] = seq_len
         batch_dict['num_vec_patches'] = num_vec_patches
         batch_dict['vector_patch_size'] = truncated_batch[0]['patch_size']
