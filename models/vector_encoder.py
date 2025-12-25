@@ -116,160 +116,125 @@ class VectorModalityEncoder(nn.Module):
         catchment_padding_mask: Optional[Tensor] = None
     ) -> tuple[Tensor, Dict]:
         """
-        Forward pass with spatial patchify
+        Forward pass (完全对齐 Image Encoder 的逻辑)
 
         Args:
             x_vec: [B, num_patches, patch_size, T] patch-level time series
             static_attr: [B, num_patches, patch_size, stat_dim] patch-level static attributes
-            patch_mask: [B, num_patches, T] bool mask (True = masked PATCH, False = visible)
+            patch_mask: [B, num_patches, T] bool mask (True = masked, False = visible)
             catchment_padding_mask: [B, num_patches, patch_size] bool mask (True = padded catchment)
 
         Returns:
-            encoder_output: [B, L_visible+1, d_model] - sequence of visible patch tokens + static token
+            encoder_output: [B, L_visible+1, d_model] - sequence of visible (patch, time) tokens + static token
             mask_info: dict with mask information for decoder
         """
-        # Get dimensions
         B, num_patches, patch_size, T = x_vec.shape
 
         # Ensure dtype consistency
         static_attr = static_attr.to(dtype=self.in_proj.weight.dtype)
+        x_vec = x_vec.to(dtype=self.in_proj.weight.dtype)
 
-        # ===== Step 1: VECTORIZED visible patch selection (NO LOOPS!) =====
-        # Encoder should never see masked patches
-        # patch_mask: [B, num_patches, T] - a patch is visible if ALL timesteps are visible
-        # Actually: a patch is visible if NONE of its timesteps are masked
-        visible_patch_mask = ~patch_mask.any(dim=2)  # [B, num_patches] True = visible patch
+        # ===== Step 1: Aggregate patches (类似 Image 的 patchify，但我们已经 patchified了) =====
+        # Aggregate catchments within each patch: [B, num_patches, patch_size, T] -> [B, num_patches, T]
+        # Handle catchment_padding_mask if provided
+        if catchment_padding_mask is not None:
+            # [B, num_patches, patch_size, 1]
+            valid_catchment = (~catchment_padding_mask).unsqueeze(-1).float()
+            # Mean pooling over patch_size dimension, excluding padded catchments
+            x_aggregated = (x_vec * valid_catchment).sum(dim=2) / (valid_catchment.sum(dim=2) + 1e-6)
+            static_aggregated = (static_attr * valid_catchment).sum(dim=2) / (valid_catchment.sum(dim=2) + 1e-6)
+        else:
+            # Simple mean pooling
+            x_aggregated = x_vec.mean(dim=2)  # [B, num_patches, T]
+            static_aggregated = static_attr.mean(dim=2)  # [B, num_patches, stat_dim]
 
-        # Count visible patches per sample
-        num_visible_per_sample = visible_patch_mask.sum(dim=1)  # [B]
+        # Now we have "patches": [B, num_patches, T]
+        # This is analogous to Image's [B, T, num_patches, patch_dim]
+        # But with dimensions swapped
+
+        # ===== Step 2: VECTORIZED selection of visible (patch, time) pairs =====
+        # Get visibility mask (True = visible)
+        visible_mask = ~patch_mask  # [B, num_patches, T]
+
+        # Select visible (patch, time) tokens using boolean indexing
+        # This flattens the selected tokens into [Total_Visible]
+        x_visible = x_aggregated[visible_mask]  # [Total_Visible]
+
+        # Calculate number of visible tokens per sample
+        num_visible_per_sample = visible_mask.sum(dim=(1, 2))  # [B]
         max_len = num_visible_per_sample.max().item()
 
-        # Edge case: no visible patches
+        # ===== Edge case: no visible tokens =====
         if max_len == 0:
-            # Return dummy output
-            dummy_output = torch.zeros(B, 1, self.d_model, device=x_vec.device, dtype=self.in_proj.weight.dtype)
-            dummy_padding_mask = torch.ones(B, 1, device=x_vec.device, dtype=torch.bool)
+            encoder_output = torch.zeros(B, 1, self.d_model, device=x_vec.device, dtype=self.in_proj.weight.dtype)
+            padding_mask = torch.ones(B, 1, device=x_vec.device, dtype=torch.bool)
             mask_info = {
                 'mask': patch_mask,
                 'lengths': [0] * B,
-                'padding_mask': dummy_padding_mask,
+                'padding_mask': padding_mask,
             }
-            return dummy_output, mask_info
+            return encoder_output, mask_info
 
-        # Check if all samples have same number of visible patches (should be true with fixed mask ratio)
+        # ===== Reshape visible tokens to [B, max_len] =====
+        # Check if all samples have same length (should be true with fixed mask ratio)
         if (num_visible_per_sample == max_len).all():
-            # FAST PATH: All samples have same length, VECTORIZED selection!
-            # visible_patch_mask: [B, num_patches] boolean mask
-            # x_vec: [B, num_patches, patch_size, T]
-
-            # Directly use boolean indexing to select all visible patches (Flat)
-            x_flat = x_vec[visible_patch_mask]  # [Total_Visible, patch_size, T]
-            static_flat = static_attr[visible_patch_mask]  # [Total_Visible, patch_size, stat_dim]
-
-            # Reshape back to [B, max_len, ...]
-            # FAST PATH guarantees each sample has same number of visible patches
-            x_padded = x_flat.view(B, max_len, patch_size, T)
-            static_padded = static_flat.view(B, max_len, patch_size, -1)
+            # FAST PATH: All samples have same length, no padding needed!
+            x = x_visible.view(B, max_len)  # [B, max_len]
             padding_mask = torch.zeros(B, max_len, device=x_vec.device, dtype=torch.bool)
             lengths = [max_len] * B
-
-            # Also handle catchment_padding_mask (VECTORIZED!)
-            if catchment_padding_mask is not None:
-                catchment_padding_flat = catchment_padding_mask[visible_patch_mask]  # [Total_Visible, patch_size]
-                catchment_padding_visible = catchment_padding_flat.view(B, max_len, patch_size)
-            else:
-                catchment_padding_visible = torch.zeros(B, max_len, patch_size, device=x_vec.device, dtype=torch.bool)
-
         else:
             # SLOW PATH: Different lengths, need padding
-            x_padded = torch.zeros(B, max_len, patch_size, T, device=x_vec.device, dtype=self.in_proj.weight.dtype)
-            static_padded = torch.zeros(B, max_len, patch_size, static_attr.shape[-1], device=x_vec.device, dtype=self.in_proj.weight.dtype)
+            x = torch.zeros(B, max_len, device=x_vec.device, dtype=self.in_proj.weight.dtype)
             padding_mask = torch.zeros(B, max_len, device=x_vec.device, dtype=torch.bool)
             lengths = num_visible_per_sample.cpu().tolist()
 
+            # Fill in the data
+            offset = 0
             for b in range(B):
                 length = lengths[b]
-                x_padded[b, :length] = x_vec[b, visible_patch_mask[b]].to(dtype=self.in_proj.weight.dtype)
-                static_padded[b, :length] = static_attr[b, visible_patch_mask[b]].to(dtype=self.in_proj.weight.dtype)
+                x[b, :length] = x_visible[offset:offset+length]
                 if length < max_len:
                     padding_mask[b, length:] = True
-
-            # Handle catchment_padding_mask
-            if catchment_padding_mask is not None:
-                catchment_padding_visible = []
-                for b in range(B):
-                    catch_pad_b = catchment_padding_mask[b, visible_patch_mask[b]]  # [num_visible, patch_size]
-                    # Pad to max_len
-                    if lengths[b] < max_len:
-                        pad = torch.ones(max_len - lengths[b], patch_size, device=x_vec.device, dtype=torch.bool)
-                        catch_pad_b = torch.cat([catch_pad_b, pad], dim=0)
-                    catchment_padding_visible.append(catch_pad_b)
-                catchment_padding_visible = torch.stack(catchment_padding_visible, dim=0)  # [B, max_len, patch_size]
-            else:
-                catchment_padding_visible = torch.zeros(B, max_len, patch_size, device=x_vec.device, dtype=torch.bool)
-
-        # Aggregate: [B, max_len, patch_size, T] -> [B, max_len, T]
-        # Mean pooling over catchments, excluding padded catchments
-        # Use 1e-6 instead of 1e-8 for FP16 compatibility (1e-8 rounds to 0 in FP16)
-        valid_mask = (~catchment_padding_visible).unsqueeze(-1).float()  # [B, max_len, patch_size, 1]
-        x_aggregated = (x_padded * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-6)  # [B, max_len, T]
-
-        # Similarly aggregate static attributes
-        static_aggregated = (static_padded * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-6)  # [B, max_len, stat_dim]
+                offset += length
 
         # ===== Step 3: Project to d_model =====
-        # [B, max_len, T] -> [B, max_len, T, d_model]
-        # Ensure dtype matches model weights for mixed precision training
-        x_aggregated = x_aggregated.to(dtype=self.in_proj.weight.dtype)
-        x = self.in_proj(x_aggregated.unsqueeze(-1))  # Add feature dim: [B, max_len, T, 1] -> [B, max_len, T, d_model]
+        # [B, max_len] -> [B, max_len, d_model]
+        x = self.in_proj(x.unsqueeze(-1))  # [B, max_len, 1] -> [B, max_len, d_model]
 
-        # ===== Step 4: Add positional embeddings (spatial + temporal) BEFORE flattening =====
-        # Get visible patch indices
-        # visible_patch_mask: [B, num_patches] - True for visible patches
-        # We need to gather the patch indices for each sample
-        patch_indices_per_sample = []
-        for b in range(B):
-            visible_idx = torch.nonzero(visible_patch_mask[b], as_tuple=True)[0]  # [max_len]
-            patch_indices_per_sample.append(visible_idx)
+        # ===== Step 4: VECTORIZED position embeddings (完全对齐 Image Encoder!) =====
+        # Create grids of indices [B, num_patches, T]
+        # Patch indices: [[0,0...], [1,1...], ...] for each time step
+        p_indices = torch.arange(num_patches, device=x_vec.device).view(1, num_patches, 1).expand(B, num_patches, T)
 
-        # Stack into [B, max_len]
-        patch_indices = torch.stack(patch_indices_per_sample, dim=0)  # [B, max_len]
+        # Temporal indices: [[0, 1, 2...], [0, 1, 2...]] repeated for each patch
+        t_indices = torch.arange(T, device=x_vec.device).view(1, 1, T).expand(B, num_patches, T)
+
+        # Select indices for visible tokens
+        p_visible = p_indices[visible_mask].view(B, -1)  # [B, max_len]
+        t_visible = t_indices[visible_mask].view(B, -1)  # [B, max_len]
 
         # Gather spatial PE: self.spatial_pos is [1, num_patches, d_model]
-        # spatial_emb: [B, max_len, d_model]
-        spatial_emb = self.spatial_pos[0, patch_indices.view(-1)].view(B, max_len, self.d_model)
+        spatial_emb = self.spatial_pos[0, p_visible.view(-1)].view(B, max_len, -1)  # [B, max_len, d_model]
 
-        # Add spatial PE (broadcast to time dimension)
-        x = x + spatial_emb.unsqueeze(2)  # [B, max_len, T, d_model]
+        # Gather temporal PE: self.temporal_pos.pe is [1, max_time, d_model]
+        temporal_pe = self.temporal_pos.pe.squeeze(0)  # [max_time, d_model]
+        temporal_emb = temporal_pe[t_visible.view(-1)].view(B, max_len, -1)  # [B, max_len, d_model]
 
-        # Gather temporal PE for each time step
-        # temporal_pos.pe: [1, max_len, d_model] where max_len is max_time_steps
-        temporal_pe = self.temporal_pos.pe.squeeze(0)  # [max_time_steps, d_model]
-        temporal_emb = temporal_pe[:T, :]  # [T, d_model]
+        # Add both PEs to x (vectorized!)
+        x = x + spatial_emb + temporal_emb
 
-        # Add temporal PE (broadcast to batch and patch dimensions)
-        x = x + temporal_emb.unsqueeze(0).unsqueeze(0)  # [B, max_len, T, d_model]
-
-        # ===== Step 5: Flatten time dimension =====
-        # [B, max_len, T, d_model] -> [B, max_len*T, d_model]
-        x = x.reshape(B, max_len * T, self.d_model)
-
-        # Add modality token (CAV-MAE style: after pos_embed, before transformer)
+        # ===== Step 5: Add modality token =====
         if self.modality_token is not None:
-            x = x + self.modality_token  # [1, 1, d_model] broadcast to [B, max_len*T, d_model]
-
-        # Update padding mask for flattened sequence
-        padding_mask_flat = padding_mask.unsqueeze(-1).expand(-1, -1, T).reshape(B, max_len * T)
+            x = x + self.modality_token  # [1, 1, d_model] broadcast to [B, max_len, d_model]
 
         # ===== Step 6: FiLM-modulated Transformer layers =====
-        # Use aggregated static attributes (pooled from patches)
-        # static_aggregated: [B, max_len, stat_dim]
-        # We need a single static vector per sample for FiLM
-        # Pool over patches (use 1e-6 for FP16 compatibility)
-        static_pooled = (static_aggregated * (~padding_mask).unsqueeze(-1).float()).sum(dim=1) / ((~padding_mask).sum(dim=1, keepdim=True).float() + 1e-6)  # [B, stat_dim]
-        # Ensure dtype consistency for mixed precision
-        static_pooled = static_pooled.to(dtype=self.in_proj.weight.dtype)
+        # Compute global static vector for FiLM
+        # We need to aggregate static_aggregated [B, num_patches, stat_dim] to [B, stat_dim]
+        # Use only visible patches (patches that have at least one visible timestep)
+        visible_patches = visible_mask.any(dim=2)  # [B, num_patches]
+        static_pooled = (static_aggregated * visible_patches.unsqueeze(-1).float()).sum(dim=1) / (visible_patches.sum(dim=1, keepdim=True).float() + 1e-6)  # [B, stat_dim]
 
+        # Apply FiLM layers
         if self.use_weighted_fm:
             # Phase 2: Collect multi-layer features
             x_feats = []
@@ -287,7 +252,7 @@ class VectorModalityEncoder(nn.Module):
                 beta = beta.unsqueeze(1)
 
                 # Apply FiLM layer
-                x = layer(x, gamma, beta, key_padding_mask=padding_mask_flat)
+                x = layer(x, gamma, beta, key_padding_mask=padding_mask)
 
                 # Save specified layers
                 if idx in self.use_fm_layers:
@@ -302,7 +267,7 @@ class VectorModalityEncoder(nn.Module):
 
             # Update padding mask
             static_padding = torch.zeros(B, 1, device=x_vec.device, dtype=torch.bool)
-            padding_mask_full = torch.cat([padding_mask_flat, static_padding], dim=1)
+            padding_mask_full = torch.cat([padding_mask, static_padding], dim=1)
 
             mask_info = {
                 'mask': patch_mask,
@@ -319,7 +284,7 @@ class VectorModalityEncoder(nn.Module):
                 gamma, beta = gb.chunk(2, dim=-1)
                 gamma = gamma.unsqueeze(1)
                 beta = beta.unsqueeze(1)
-                x = layer(x, gamma, beta, key_padding_mask=padding_mask_flat)
+                x = layer(x, gamma, beta, key_padding_mask=padding_mask)
 
             # ===== Step 7: Normalize (NO POOLING - CrossMAE style) =====
             x = self.norm(x)
@@ -330,7 +295,7 @@ class VectorModalityEncoder(nn.Module):
 
             # Update padding mask
             static_padding = torch.zeros(B, 1, device=x_vec.device, dtype=torch.bool)
-            padding_mask_full = torch.cat([padding_mask_flat, static_padding], dim=1)
+            padding_mask_full = torch.cat([padding_mask, static_padding], dim=1)
 
             mask_info = {
                 'mask': patch_mask,
