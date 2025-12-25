@@ -103,6 +103,19 @@ class MAEConfig:
     betas = (0.9, 0.95)  # Adam betas
     eps = 1e-8  # Adam epsilon
 
+    # Gradient clipping (CRITICAL for stability with FP16)
+    gradient_clip_norm = 1.0  # Clip gradients to max norm of 1.0
+
+    # Task loss weights (to balance different modalities)
+    # Adjust these if some losses are much smaller/larger than others
+    task_weights = {
+        'precip_loss': 100.0,    # Precipitation tends to have very small values
+        'soil_loss': 10.0,       # Soil moisture has moderate values
+        'temp_loss': 10.0,       # Temperature has moderate values
+        'evap_loss': 1.0,        # Evaporation baseline
+        'riverflow_loss': 1.0,   # Riverflow baseline
+    }
+
     # Training schedule
     epochs = 10  # Total number of epochs
     warmup_epochs = 5  # Number of warmup epochs
@@ -114,6 +127,12 @@ class MAEConfig:
     use_fp16 = True  # Use mixed precision training (FP16)
     gradient_accumulation_steps = 1  # Gradient accumulation steps
     # num_workers is now defined in Performance optimization section above
+
+    # FP16 Loss Scaling Configuration (to prevent underflow/overflow)
+    initial_scale_power = 16  # Initial loss scale = 2^16 = 65536
+    loss_scale_window = 1000  # Consecutive steps before increasing loss scale
+    min_loss_scale = 1.0      # Minimum loss scale
+    hysteresis = 2            # Number of overflows before decreasing scale
 
     # ========== Logging and Checkpointing ==========
     # WandB settings

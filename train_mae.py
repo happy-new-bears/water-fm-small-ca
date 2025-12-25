@@ -275,6 +275,55 @@ def create_datasets(config, rank):
         print(f"\n✓ Train samples: {len(train_dataset)}")
         print(f"✓ Val samples: {len(val_dataset)}")
 
+        # Print normalization statistics
+        print("\n" + "="*70)
+        print("NORMALIZATION STATISTICS")
+        print("="*70)
+
+        stats = train_dataset.stats
+
+        # Image modalities
+        print("\n📊 IMAGE MODALITIES:")
+        for modality in ['precip', 'soil', 'temp']:
+            if f'{modality}_mean' in stats and f'{modality}_std' in stats:
+                mean = stats[f'{modality}_mean'].item()
+                std = stats[f'{modality}_std'].item()
+                print(f"  {modality.upper():12s}: mean = {mean:10.4f}, std = {std:10.4f}")
+
+        # Vector modalities
+        print("\n📊 VECTOR MODALITIES (per-catchment statistics):")
+        for modality in ['evap', 'riverflow']:
+            if f'{modality}_mean' in stats and f'{modality}_std' in stats:
+                means = stats[f'{modality}_mean']
+                stds = stats[f'{modality}_std']
+                print(f"  {modality.upper():12s}:")
+                print(f"    Mean range: [{means.min().item():8.4f}, {means.max().item():8.4f}]")
+                print(f"    Std range:  [{stds.min().item():8.4f}, {stds.max().item():8.4f}]")
+                print(f"    Avg mean:   {means.mean().item():8.4f}")
+                print(f"    Avg std:    {stds.mean().item():8.4f}")
+
+        # Static attributes
+        if 'static_mean' in stats and 'static_std' in stats:
+            print("\n📊 STATIC ATTRIBUTES:")
+            static_mean = stats['static_mean']
+            static_std = stats['static_std']
+            print(f"  Number of attributes: {len(static_mean)}")
+            print(f"  Mean range: [{static_mean.min().item():8.4f}, {static_mean.max().item():8.4f}]")
+            print(f"  Std range:  [{static_std.min().item():8.4f}, {static_std.max().item():8.4f}]")
+
+        # Land mask info
+        if 'land_mask' in stats:
+            land_mask = stats['land_mask']
+            num_land = (land_mask == 1).sum().item()
+            num_ocean = (land_mask == 0).sum().item()
+            total = land_mask.numel()
+            print("\n📊 LAND MASK:")
+            print(f"  Total pixels:  {total:6d}")
+            print(f"  Land pixels:   {num_land:6d} ({num_land/total*100:5.2f}%)")
+            print(f"  Ocean pixels:  {num_ocean:6d} ({num_ocean/total*100:5.2f}%)")
+
+        print("="*70 + "\n")
+
     return train_dataset, val_dataset
 
 
@@ -402,6 +451,16 @@ def train_epoch(model, train_loader, epoch, config, rank, world_size, wandb):
 
         # Forward pass
         total_loss, loss_dict = model(batch_gpu)
+
+        # Check for NaN/Inf in loss before backward pass
+        if not torch.isfinite(total_loss):
+            if rank == 0:
+                print(f"\n⚠ WARNING: Non-finite loss detected at epoch {epoch+1}, batch {batch_idx+1}")
+                print(f"  total_loss: {total_loss.item()}")
+                for key, val in loss_dict.items():
+                    print(f"  {key}: {val.item()}")
+                print("  Skipping this batch and continuing training...")
+            continue  # Skip this batch
 
         # Backward + step (DeepSpeed API)
         model.backward(total_loss)
@@ -614,6 +673,63 @@ def main():
     # Create datasets
     train_dataset, val_dataset = create_datasets(config, rank)
 
+    # Print normalization statistics
+    if rank == 0:
+        print(f"\n{'=' * 60}")
+        print("Normalization Statistics")
+        print("=" * 60)
+
+        stats = train_dataset.stats
+
+        # Image modalities (scalar mean/std)
+        print(f"\n📊 IMAGE MODALITIES:")
+        for modality in ['precip', 'soil', 'temp']:
+            mean = stats[f'{modality}_mean'].item()
+            std = stats[f'{modality}_std'].item()
+            print(f"\n  {modality.upper()}:")
+            print(f"    Mean: {mean:12.6f}")
+            print(f"    Std:  {std:12.6f}")
+
+            # Sanity checks
+            if mean < 0 and modality == 'precip':
+                print(f"    ⚠️  WARNING: Negative mean for precipitation!")
+            if std < 1e-6:
+                print(f"    ⚠️  WARNING: Very small std ({std:.2e})")
+
+        # Vector modalities (per-catchment mean/std)
+        print(f"\n📊 VECTOR MODALITIES:")
+        for modality in ['evap', 'riverflow']:
+            mean_vec = stats[f'{modality}_mean']  # [num_catchments]
+            std_vec = stats[f'{modality}_std']    # [num_catchments]
+
+            print(f"\n  {modality.upper()} (604 catchments):")
+            print(f"    Mean range: [{mean_vec.min().item():10.4f}, {mean_vec.max().item():10.4f}]")
+            print(f"    Std range:  [{std_vec.min().item():10.4f}, {std_vec.max().item():10.4f}]")
+            print(f"    Mean of means: {mean_vec.mean().item():10.4f}")
+            print(f"    Mean of stds:  {std_vec.mean().item():10.4f}")
+
+        # Static attributes
+        print(f"\n📊 STATIC ATTRIBUTES ({len(config.static_attrs)} features):")
+        static_mean = stats['static_mean']
+        static_std = stats['static_std']
+        print(f"    Features: {', '.join(config.static_attrs[:3])}...")
+        print(f"    Mean range: [{static_mean.min().item():10.4f}, {static_mean.max().item():10.4f}]")
+        print(f"    Std range:  [{static_std.min().item():10.4f}, {static_std.max().item():10.4f}]")
+
+        # Land mask info
+        land_mask = stats['land_mask']
+        num_land = (land_mask == 1).sum().item()
+        num_ocean = (land_mask == 0).sum().item()
+        total = land_mask.numel()
+        print(f"\n📍 LAND MASK:")
+        print(f"    Shape: {land_mask.shape}")
+        print(f"    Land pixels:  {num_land:6d} ({num_land/total*100:5.2f}%)")
+        print(f"    Ocean pixels: {num_ocean:6d} ({num_ocean/total*100:5.2f}%)")
+
+        print(f"\n" + "=" * 60)
+        print("✅ All statistics loaded successfully!")
+        print("=" * 60)
+
     # Create dataloaders
     train_loader, val_loader, train_sampler, val_sampler, valid_patch_indices = \
         create_dataloaders(train_dataset, val_dataset, config, rank, world_size)
@@ -649,6 +765,12 @@ def main():
         },
     }
 
+    # Add gradient clipping if specified in config
+    if hasattr(config, 'gradient_clip_norm') and config.gradient_clip_norm > 0:
+        ds_config["gradient_clipping"] = config.gradient_clip_norm
+        if rank == 0:
+            print(f"✓ Gradient clipping enabled: {config.gradient_clip_norm}")
+
     # Add ZeRO stage-specific config to avoid PyTorch API compatibility issues
     if config.zero_stage > 0:
         ds_config["zero_optimization"].update({
@@ -660,7 +782,26 @@ def main():
         })
 
     if config.use_fp16:
-        ds_config["fp16"] = {"enabled": True}
+        # Use config values or defaults
+        initial_scale_power = getattr(config, 'initial_scale_power', 16)
+        loss_scale_window = getattr(config, 'loss_scale_window', 1000)
+        min_loss_scale = getattr(config, 'min_loss_scale', 1)
+        hysteresis = getattr(config, 'hysteresis', 2)
+
+        ds_config["fp16"] = {
+            "enabled": True,
+            "loss_scale": 0,  # Dynamic loss scaling
+            "initial_scale_power": initial_scale_power,
+            "loss_scale_window": loss_scale_window,
+            "hysteresis": hysteresis,
+            "min_loss_scale": min_loss_scale,
+        }
+        if rank == 0:
+            print(f"✓ FP16 with dynamic loss scaling:")
+            print(f"  - initial_scale: 2^{initial_scale_power} = {2**initial_scale_power}")
+            print(f"  - min_loss_scale: {min_loss_scale}")
+            print(f"  - loss_scale_window: {loss_scale_window}")
+            print(f"  - hysteresis: {hysteresis}")
 
     # Initialize DeepSpeed
     model, optimizer, _, _ = ds.initialize(

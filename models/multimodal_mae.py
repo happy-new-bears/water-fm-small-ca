@@ -298,13 +298,13 @@ class MultiModalMAE(nn.Module):
         device = precip_token.device
 
         # Step 2: 拼接所有模态的visible tokens
-        # 注意: Vector modality的最后一个token是static token，需要排除
+        # 保留 Vector modality 的 static token（包含重要的全局静态环境信息）
         all_tokens = torch.cat([
             precip_token,              # [B, L_precip, d_model]
             soil_token,                # [B, L_soil, d_model]
             temp_token,                # [B, L_temp, d_model]
-            evap_token[:, :-1, :],     # [B, L_evap-1, d_model] 排除static token
-            riverflow_token[:, :-1, :] # [B, L_river-1, d_model] 排除static token
+            evap_token,                # [B, L_evap, d_model] 保留 static token
+            riverflow_token            # [B, L_river, d_model] 保留 static token
         ], dim=1)  # [B, L_total, d_model]
 
         # Step 3: 创建padding mask (拼接各自的padding mask)
@@ -320,16 +320,13 @@ class MultiModalMAE(nn.Module):
         riverflow_pad = riverflow_mask_info.get('padding_mask',
             torch.zeros(B, riverflow_token.shape[1], device=device, dtype=torch.bool))
 
-        # 排除vector modality的static token的padding (最后一个是static token)
-        evap_pad_seq = evap_pad[:, :-1] if evap_pad.shape[1] > 0 else evap_pad
-        riverflow_pad_seq = riverflow_pad[:, :-1] if riverflow_pad.shape[1] > 0 else riverflow_pad
-
+        # 保留完整的 padding mask（包括 static token 的 mask）
         all_padding_mask = torch.cat([
             precip_pad,
             soil_pad,
             temp_pad,
-            evap_pad_seq,
-            riverflow_pad_seq
+            evap_pad,          # 包含 static token 的 mask
+            riverflow_pad      # 包含 static token 的 mask
         ], dim=1)  # [B, L_total]
 
         # Step 4: 通过shared transformer进行跨模态融合

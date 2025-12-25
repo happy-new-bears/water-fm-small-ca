@@ -291,25 +291,45 @@ class MultiModalHydroDatasetOptimized(Dataset):
         self,
         modality: str,
         land_mask: torch.Tensor,
-        num_samples: int = 1000
+        num_samples: int = None  # None = use all timesteps
     ) -> Dict[str, torch.Tensor]:
-        """Compute statistics for image modality"""
+        """
+        Compute statistics for image modality (ONLY valid land values)
+
+        Note: Changed to use all timesteps for accurate statistics
+        """
         all_land_values = []
 
-        sample_indices = np.random.choice(
-            self.num_days,
-            min(num_samples, self.num_days),
-            replace=False
-        )
+        # Use ALL timesteps for accurate statistics (not sampling)
+        print(f"      Computing stats from all {self.num_days} timesteps...")
 
-        for idx in sample_indices:
+        for idx in range(self.num_days):
             img = self.image_data[modality][idx]
+
+            # ✅ Get land values (corrected mask excludes missing pixels)
             land_values = img[land_mask.numpy() == 1]
-            all_land_values.append(land_values)
+
+            # ✅ Safety check - filter any remaining invalid values (should be none now)
+            valid_mask = (land_values > -1000) & (land_values < 1e6) & (~np.isnan(land_values))
+            valid_values = land_values[valid_mask]
+
+            if len(valid_values) > 0:
+                all_land_values.append(valid_values)
+
+            # Progress indicator for large datasets
+            if (idx + 1) % 1000 == 0:
+                print(f"        Processed {idx + 1}/{self.num_days} timesteps...")
+
+        if len(all_land_values) == 0:
+            raise ValueError(f"No valid land values found for {modality}!")
 
         all_land_values = np.concatenate(all_land_values)
         mean = torch.tensor(all_land_values.mean(), dtype=torch.float32)
         std = torch.tensor(all_land_values.std(), dtype=torch.float32)
+
+        print(f"      {modality}: computed from {len(all_land_values)} valid land pixels")
+        print(f"        Mean: {mean.item():.4f}, Std: {std.item():.4f}")
+        print(f"        Range: [{all_land_values.min():.2f}, {all_land_values.max():.2f}]")
 
         return {'mean': mean, 'std': std}
 
@@ -435,21 +455,21 @@ class MultiModalHydroDatasetOptimized(Dataset):
         Returns:
             img_norm: [T, H, W] torch.Tensor
         """
-        # Convert to torch FIRST (much faster than numpy!)
-        img_tensor = torch.from_numpy(img_seq).float()  # [T, H, W]
-
         mean = self.stats[f'{modality}_mean'].item()
         std = self.stats[f'{modality}_std'].item()
         land_mask = self.stats['land_mask']  # Already torch.Tensor [H, W]
 
-        # Broadcast land_mask from [H, W] to [T, H, W]
+        # ✅ Convert to torch
+        img_tensor = torch.from_numpy(img_seq).float()  # [T, H, W]
+
+        # ✅ Broadcast land_mask from [H, W] to [T, H, W]
         mask_3d = (land_mask == 1).unsqueeze(0)  # [1, H, W]
 
-        # Torch vectorized normalization (GPU-ready!)
+        # ✅ Normalize (corrected mask excludes missing pixels, so all land values are valid)
         img_norm = torch.where(
             mask_3d,
             (img_tensor - mean) / (std + 1e-8),
-            torch.tensor(0.0)
+            torch.tensor(0.0)  # Ocean (and removed missing pixels) set to 0
         )
 
         return img_norm
