@@ -2,17 +2,26 @@
 Training script for Multi-modal MAE with DeepSpeed
 
 Usage:
-    # Single machine, 4 GPUs
+    # Single machine, 4 GPUs with default config
     deepspeed --num_gpus=4 train_mae.py
 
+    # With custom config file
+    deepspeed --num_gpus=4 train_mae.py --config configs/mae_config_exp1.py
+
+    # Multiple experiments in parallel (different GPUs)
+    deepspeed --num_gpus=2 --include localhost:0,1 train_mae.py --config configs/mae_config_exp1.py
+    deepspeed --num_gpus=2 --include localhost:2,3 train_mae.py --config configs/mae_config_exp2.py
+
     # Or use torchrun
-    torchrun --nproc_per_node=4 train_mae.py
+    torchrun --nproc_per_node=4 train_mae.py --config configs/mae_config_exp1.py
 """
 
 import os
 import sys
 import time
 import json
+import argparse
+import importlib.util
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +39,57 @@ from datasets.multimodal_dataset_optimized import MultiModalHydroDatasetOptimize
 from datasets.data_utils import load_vector_data_from_parquet
 from datasets.collate import MultiScaleMaskedCollate
 from configs.mae_config import MAEConfig
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Multi-modal MAE Training with DeepSpeed')
+    parser.add_argument(
+        '--config',
+        type=str,
+        default=None,
+        help='Path to config file (e.g., configs/mae_config_exp1.py). If not provided, uses default config.'
+    )
+    parser.add_argument(
+        '--local_rank',
+        type=int,
+        default=0,
+        help='Local rank for distributed training (automatically set by DeepSpeed)'
+    )
+    args = parser.parse_args()
+    return args
+
+
+def load_config_from_file(config_path):
+    """
+    Load config from a Python file
+
+    Args:
+        config_path: Path to config file (e.g., 'configs/mae_config_exp1.py')
+
+    Returns:
+        MAEConfig instance from the specified file
+    """
+    config_path = Path(config_path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    # Load module from file path
+    spec = importlib.util.spec_from_file_location("custom_config", config_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load config from {config_path}")
+
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+
+    # Get MAEConfig class from module and instantiate
+    if not hasattr(config_module, 'MAEConfig'):
+        raise AttributeError(f"Config file {config_path} must define a MAEConfig class")
+
+    config = config_module.MAEConfig()
+
+    return config
 
 
 def save_config(config, save_dir, filename='config.json'):
@@ -479,7 +539,10 @@ def validate(model, val_loader, epoch, config, rank, world_size, wandb):
 
     # Log to console (rank 0 only)
     if rank == 0:
-        print(f"\nEpoch {epoch+1} Validation Results:")
+        if epoch == -1:
+            print(f"\nBaseline Validation Results (before training):")
+        else:
+            print(f"\nEpoch {epoch+1} Validation Results:")
         print(f"  Average Loss: {avg_loss:.4f}")
         for key, value in avg_losses.items():
             print(f"  {key}: {value:.4f}")
@@ -490,7 +553,7 @@ def validate(model, val_loader, epoch, config, rank, world_size, wandb):
         # Log to WandB
         if wandb is not None:
             log_dict = {
-                'epoch': epoch + 1,
+                'epoch': 0 if epoch == -1 else epoch + 1,  # Use 0 for baseline
                 'val/loss': avg_loss,
                 'val/time': val_time,
                 'val/avg_batch_time': avg_batch_time,
@@ -508,6 +571,9 @@ def validate(model, val_loader, epoch, config, rank, world_size, wandb):
 def main():
     """Main training function"""
 
+    # Parse command line arguments
+    args = parse_args()
+
     # Initialize DeepSpeed distributed
     ds.init_distributed()
     rank = dist.get_rank()
@@ -521,8 +587,15 @@ def main():
         print(f"CUDA available: {torch.cuda.is_available()}")
         print(f"CUDA devices: {torch.cuda.device_count()}")
 
-    # Load config
-    config = MAEConfig()
+    # Load config (custom or default)
+    if args.config:
+        if rank == 0:
+            print(f"\nLoading custom config from: {args.config}")
+        config = load_config_from_file(args.config)
+    else:
+        if rank == 0:
+            print(f"\nUsing default config: configs/mae_config.py")
+        config = MAEConfig()
 
     # Create timestamped output directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -611,6 +684,20 @@ def main():
 
     training_start_time = time.time()
     best_val_loss = float('inf')
+
+    # Validate before training (epoch -1) to establish baseline
+    if rank == 0:
+        print(f"\n{'=' * 60}")
+        print("Baseline validation (before training)...")
+        print("=" * 60)
+
+    initial_val_loss = validate(
+        model, val_loader, -1, config, rank, world_size, wandb
+    )
+    best_val_loss = initial_val_loss
+
+    if rank == 0:
+        print(f"Baseline validation loss: {initial_val_loss:.4f}")
 
     for epoch in range(config.epochs):
         epoch_wall_start = time.time()

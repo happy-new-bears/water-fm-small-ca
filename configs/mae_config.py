@@ -37,6 +37,7 @@ class MAEConfig:
 
     # Vector patch settings (for spatial aggregation)
     vector_patch_size = 8  # Number of catchments per patch
+    num_catchments = 604  # Total number of catchments
 
     # Sequence settings
     max_time_steps = 30  # Maximum sequence length (days)

@@ -93,6 +93,10 @@ class MultiModalMAE(nn.Module):
         )
 
         # ========== Vector Encoders (with FiLM) ==========
+        # Use max_len = 120 for vector encoder positional encoding
+        # This is sufficient for typical visible sequence lengths
+        vector_max_len = 120
+
         self.evap_encoder = VectorModalityEncoder(
             in_feat=1,
             stat_dim=config.static_attr_dim,
@@ -100,10 +104,11 @@ class MultiModalMAE(nn.Module):
             n_layers=config.vec_encoder_layers,
             nhead=config.nhead,
             dropout=config.dropout,
-            max_len=config.max_time_steps,
+            max_len=vector_max_len,  # Use 120 instead of calculated 2280
             use_weighted_fm=config.use_weighted_fm,  # Phase 2
             use_fm_layers=config.use_fm_layers,      # Phase 2
             use_input=config.use_input,              # Phase 2
+            patch_size=config.vector_patch_size,     # NEW: Vector patch size
         )
 
         self.riverflow_encoder = VectorModalityEncoder(
@@ -113,10 +118,11 @@ class MultiModalMAE(nn.Module):
             n_layers=config.vec_encoder_layers,
             nhead=config.nhead,
             dropout=config.dropout,
-            max_len=config.max_time_steps,
+            max_len=vector_max_len,  # Use 120 instead of calculated 2280
             use_weighted_fm=config.use_weighted_fm,  # Phase 2
             use_fm_layers=config.use_fm_layers,      # Phase 2
             use_input=config.use_input,              # Phase 2
+            patch_size=config.vector_patch_size,     # NEW: Vector patch size
         )
 
         # ========== Image Decoders ==========

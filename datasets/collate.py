@@ -61,6 +61,12 @@ class MultiScaleMaskedCollate:
         self.vector_modalities = ['evap', 'riverflow']
         self.all_modalities = self.image_modalities + self.vector_modalities
 
+        # For validation: use a dedicated RNG with fixed seed for reproducible masking
+        if self.mode in ['val', 'test']:
+            self.val_rng = np.random.RandomState(42)  # Fixed seed for validation
+        else:
+            self.val_rng = None
+
     def _process_land_mask(self, land_mask_path: str) -> np.ndarray:
         """
         Process land mask to identify valid patches
@@ -140,18 +146,43 @@ class MultiScaleMaskedCollate:
         B = len(batch_list)
         seq_len = self.seq_len
 
-        # Step 1: Truncate data to fixed sequence length and extract metadata
+        # Step 1: Truncate/pad data to fixed sequence length and extract metadata
         truncated_batch = []
         num_vec_patches = None  # Will be set from first sample
         for sample in batch_list:
             truncated = {}
             for key, val in sample.items():
                 if key in self.image_modalities:
-                    # Image: truncate time dimension
-                    truncated[key] = val[:seq_len]
+                    # Image: truncate/pad time dimension [T, H, W]
+                    T = val.shape[0]
+                    if T >= seq_len:
+                        truncated[key] = val[:seq_len]
+                    else:
+                        # Pad with zeros if too short
+                        if isinstance(val, torch.Tensor):
+                            pad_shape = (seq_len - T, *val.shape[1:])
+                            padding = torch.zeros(pad_shape, dtype=val.dtype, device=val.device)
+                            truncated[key] = torch.cat([val, padding], dim=0)
+                        else:
+                            pad_shape = (seq_len - T, *val.shape[1:])
+                            padding = np.zeros(pad_shape, dtype=val.dtype)
+                            truncated[key] = np.concatenate([val, padding], axis=0)
                 elif key in self.vector_modalities:
-                    # Vector patches: truncate time dimension  [num_patches, patch_size, T]
-                    truncated[key] = val[:, :, :seq_len]
+                    # Vector patches: truncate/pad time dimension [num_patches, patch_size, T]
+                    T = val.shape[2]
+                    if T >= seq_len:
+                        truncated[key] = val[:, :, :seq_len]
+                    else:
+                        # Pad with zeros if too short
+                        if isinstance(val, torch.Tensor):
+                            pad_shape = (*val.shape[:2], seq_len - T)
+                            padding = torch.zeros(pad_shape, dtype=val.dtype, device=val.device)
+                            truncated[key] = torch.cat([val, padding], dim=2)
+                        else:
+                            pad_shape = (*val.shape[:2], seq_len - T)
+                            padding = np.zeros(pad_shape, dtype=val.dtype)
+                            truncated[key] = np.concatenate([val, padding], axis=2)
+
                     if num_vec_patches is None:
                         num_vec_patches = val.shape[0]  # Get number of patches
                 else:
@@ -159,33 +190,27 @@ class MultiScaleMaskedCollate:
             truncated_batch.append(truncated)
 
         # Step 2: Generate masks
-        if self.mode == 'train':
-            masks = self._generate_masks(B, seq_len, num_vec_patches)
-        else:
-            # No masking for validation/test
-            masks = {
-                # Image masks: [B, T, num_patches]
-                **{mod: np.zeros((B, seq_len, self.num_patches), dtype=bool)
-                   for mod in self.image_modalities},
-                # Vector masks: [B, num_vec_patches, T]
-                **{mod: np.zeros((B, num_vec_patches, seq_len), dtype=bool)
-                   for mod in self.vector_modalities}
-            }
+        # Both train and val use masking, but val uses fixed seed for reproducibility
+        masks = self._generate_masks(B, seq_len, num_vec_patches)
 
         # Step 3: Stack into batch
         batch_dict = {}
 
         # Image modalities
         for mod in self.image_modalities:
+            # Handle both numpy arrays and torch tensors
             batch_dict[mod] = torch.stack([
-                torch.from_numpy(s[mod]) for s in truncated_batch
+                s[mod] if isinstance(s[mod], torch.Tensor) else torch.from_numpy(s[mod])
+                for s in truncated_batch
             ]).float()  # [B, T, 290, 180]
             batch_dict[f'{mod}_mask'] = torch.from_numpy(masks[mod])  # [B, T, num_patches]
 
         # Vector modalities (patch-level)
         for mod in self.vector_modalities:
+            # Handle both numpy arrays and torch tensors
             batch_dict[mod] = torch.stack([
-                torch.from_numpy(s[mod]) for s in truncated_batch
+                s[mod] if isinstance(s[mod], torch.Tensor) else torch.from_numpy(s[mod])
+                for s in truncated_batch
             ]).float()  # [B, num_patches, patch_size, T]
             batch_dict[f'{mod}_mask'] = torch.from_numpy(masks[mod])  # [B, num_patches, T]
 
@@ -272,11 +297,19 @@ class MultiScaleMaskedCollate:
                     num_to_mask = max(1, num_to_mask)  # At least mask 1 patch
 
                     # Randomly select which valid patches to mask
-                    masked_valid_indices = np.random.choice(
-                        num_valid,
-                        size=num_to_mask,
-                        replace=False
-                    )
+                    # Use val_rng for validation (fixed seed), otherwise use global np.random
+                    if self.val_rng is not None:
+                        masked_valid_indices = self.val_rng.choice(
+                            num_valid,
+                            size=num_to_mask,
+                            replace=False
+                        )
+                    else:
+                        masked_valid_indices = np.random.choice(
+                            num_valid,
+                            size=num_to_mask,
+                            replace=False
+                        )
 
                     # Convert to actual patch indices
                     masked_patch_indices = self.valid_patch_indices[masked_valid_indices]
@@ -316,11 +349,21 @@ class MultiScaleMaskedCollate:
                 # Randomly select which patches to mask at this timestep
                 num_to_mask = int(num_patches * self.mask_ratio)
                 patch_mask = np.zeros(num_patches, dtype=bool)
-                masked_patch_indices = np.random.choice(
-                    num_patches,
-                    size=num_to_mask,
-                    replace=False
-                )
+
+                # Use val_rng for validation (fixed seed), otherwise use global np.random
+                if self.val_rng is not None:
+                    masked_patch_indices = self.val_rng.choice(
+                        num_patches,
+                        size=num_to_mask,
+                        replace=False
+                    )
+                else:
+                    masked_patch_indices = np.random.choice(
+                        num_patches,
+                        size=num_to_mask,
+                        replace=False
+                    )
+
                 patch_mask[masked_patch_indices] = True
                 sample_masks.append(patch_mask)
 
