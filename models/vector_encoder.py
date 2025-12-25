@@ -234,6 +234,9 @@ class VectorModalityEncoder(nn.Module):
         visible_patches = visible_mask.any(dim=2)  # [B, num_patches]
         static_pooled = (static_aggregated * visible_patches.unsqueeze(-1).float()).sum(dim=1) / (visible_patches.sum(dim=1, keepdim=True).float() + 1e-6)  # [B, stat_dim]
 
+        # Ensure dtype consistency for mixed precision training
+        static_pooled = static_pooled.to(dtype=self.in_proj.weight.dtype)
+
         # Apply FiLM layers
         if self.use_weighted_fm:
             # Phase 2: Collect multi-layer features
