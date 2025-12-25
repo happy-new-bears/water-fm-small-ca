@@ -365,24 +365,26 @@ class MultiModalHydroDatasetOptimized(Dataset):
         self,
         data: np.ndarray,
         modality: str
-    ) -> np.ndarray:
+    ) -> torch.Tensor:
         """
-        Pre-normalize vector data (done once in __init__)
+        Pre-normalize vector data using TORCH (done once in __init__)
 
         Args:
-            data: [num_catchments, num_days]
+            data: [num_catchments, num_days] numpy array
             modality: 'evap' or 'riverflow'
 
         Returns:
-            normalized_data: [num_catchments, num_days]
+            normalized_data: [num_catchments, num_days] torch.Tensor
         """
-        means = self.stats[f'{modality}_mean'].numpy()  # [num_catchments]
-        stds = self.stats[f'{modality}_std'].numpy()    # [num_catchments]
+        # Convert to torch first
+        data_tensor = torch.from_numpy(data).float()
+        means = self.stats[f'{modality}_mean']  # [num_catchments]
+        stds = self.stats[f'{modality}_std']    # [num_catchments]
 
-        # Vectorized normalization (super fast!)
-        normalized = (data - means[:, np.newaxis]) / (stds[:, np.newaxis] + 1e-8)
+        # Torch vectorized normalization (GPU-ready!)
+        normalized = (data_tensor - means.unsqueeze(1)) / (stds.unsqueeze(1) + 1e-8)
 
-        return normalized.astype(np.float32)
+        return normalized
 
     def _prenormalize_static_attrs(self) -> torch.Tensor:
         """
@@ -422,31 +424,33 @@ class MultiModalHydroDatasetOptimized(Dataset):
         self,
         img_seq: np.ndarray,
         modality: str
-    ) -> np.ndarray:
+    ) -> torch.Tensor:
         """
-        Normalize image sequence (land pixels only) - VECTORIZED VERSION
+        Normalize image sequence (land pixels only) - TORCH VERSION
 
         Args:
             img_seq: [T, H, W] numpy array
             modality: str (precip/soil/temp)
 
         Returns:
-            img_norm: [T, H, W] normalized array
+            img_norm: [T, H, W] torch.Tensor
         """
+        # Convert to torch FIRST (much faster than numpy!)
+        img_tensor = torch.from_numpy(img_seq).float()  # [T, H, W]
+
         mean = self.stats[f'{modality}_mean'].item()
         std = self.stats[f'{modality}_std'].item()
-        land_mask = self.stats['land_mask'].numpy()  # [H, W]
+        land_mask = self.stats['land_mask']  # Already torch.Tensor [H, W]
 
-        # Vectorized normalization (no loop!)
         # Broadcast land_mask from [H, W] to [T, H, W]
-        mask_3d = (land_mask == 1)[np.newaxis, :, :]  # [1, H, W]
+        mask_3d = (land_mask == 1).unsqueeze(0)  # [1, H, W]
 
-        # Apply normalization to all time steps at once using np.where
-        img_norm = np.where(
+        # Torch vectorized normalization (GPU-ready!)
+        img_norm = torch.where(
             mask_3d,
-            (img_seq - mean) / (std + 1e-8),
-            0.0
-        ).astype(np.float32)
+            (img_tensor - mean) / (std + 1e-8),
+            torch.tensor(0.0)
+        )
 
         return img_norm
 
@@ -494,20 +498,20 @@ class MultiModalHydroDatasetOptimized(Dataset):
         temp_norm = self._normalize_image(temp_seq, 'temp')
 
         # 2. Vector data: Direct slicing of PRE-NORMALIZED data (ultra fast!)
-        evap_norm_all = self.evap_data_norm[:, start_day_idx:end_day_idx]  # [num_catchments, T]
-        riverflow_norm_all = self.riverflow_data_norm[:, start_day_idx:end_day_idx]  # [num_catchments, T]
+        evap_norm_all = self.evap_data_norm[:, start_day_idx:end_day_idx]  # [num_catchments, T] torch.Tensor
+        riverflow_norm_all = self.riverflow_data_norm[:, start_day_idx:end_day_idx]  # [num_catchments, T] torch.Tensor
 
-        # 3. Patchify using vectorized numpy reshape (no loops!)
+        # 3. Patchify using vectorized TORCH reshape (no loops!)
         # Pad if necessary
         if self.num_catchments % self.patch_size != 0:
             pad_size = self.num_padded - self.num_catchments
             T = evap_norm_all.shape[1]
 
-            pad_zeros_evap = np.zeros((pad_size, T), dtype=np.float32)
-            pad_zeros_river = np.zeros((pad_size, T), dtype=np.float32)
+            pad_zeros_evap = torch.zeros(pad_size, T, dtype=torch.float32)
+            pad_zeros_river = torch.zeros(pad_size, T, dtype=torch.float32)
 
-            evap_norm_all = np.concatenate([evap_norm_all, pad_zeros_evap], axis=0)
-            riverflow_norm_all = np.concatenate([riverflow_norm_all, pad_zeros_river], axis=0)
+            evap_norm_all = torch.cat([evap_norm_all, pad_zeros_evap], dim=0)
+            riverflow_norm_all = torch.cat([riverflow_norm_all, pad_zeros_river], dim=0)
 
         # Reshape: [num_padded, T] -> [num_patches, patch_size, T]
         evap_patches = evap_norm_all.reshape(self.num_patches, self.patch_size, -1)
