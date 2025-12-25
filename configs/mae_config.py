@@ -35,6 +35,9 @@ class MAEConfig:
     image_height = 290  # Image height
     image_width = 180  # Image width
 
+    # Vector patch settings (for spatial aggregation)
+    vector_patch_size = 8  # Number of catchments per patch
+
     # Sequence settings
     max_time_steps = 30  # Maximum sequence length (days)
     static_attr_dim = 11  # Number of static attributes

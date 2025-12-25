@@ -20,14 +20,15 @@ class MultiModalHydroDataset(Dataset):
 
     Handles 5 modalities:
     - 3 image modalities: precipitation, soil_moisture, temperature
-    - 2 vector modalities: evaporation, riverflow
+    - 2 vector modalities: evaporation, riverflow (patchified)
     - Static attributes: catchment characteristics
 
     Features:
     - Per-catchment normalization for vectors
     - Land-only normalization for images
-    - Supports variable sequence lengths via collate function
-    - Filters out samples with missing riverflow data
+    - Spatial patchify for vector modalities (patch_size=8)
+    - Each sample contains full-field data (all catchments + full image)
+    - Samples are indexed by time windows only (no per-catchment duplication)
     """
 
     def __init__(
@@ -411,31 +412,21 @@ class MultiModalHydroDataset(Dataset):
             'std': self.static_attrs.std(dim=0),
         }
 
-    def _build_valid_samples(self) -> List[Tuple[int, int]]:
+    def _build_valid_samples(self) -> List[int]:
         """
-        Build valid sample indices
+        Build valid sample indices (time windows only)
 
         Rules:
         1. Must have sufficient length (max_sequence_length days)
-        2. Riverflow cannot have NaN in the window
-        3. Use stride for sliding window (default: 30 days)
+        2. Use stride for sliding window (default: 30 days)
+
+        Returns:
+            List of day indices for valid time windows
         """
         valid_samples = []
 
-        for catch_idx in range(self.num_catchments):
-            for day_idx in range(0, self.num_days - self.max_sequence_length + 1, self.stride):
-                # Extract riverflow in window
-                window_riverflow = self.riverflow_data[
-                    catch_idx,
-                    day_idx:day_idx + self.max_sequence_length
-                ]
-
-                # Check for missing values
-                if np.isnan(window_riverflow).any():
-                    continue
-
-                # Valid sample
-                valid_samples.append((catch_idx, day_idx))
+        for day_idx in range(0, self.num_days - self.max_sequence_length + 1, self.stride):
+            valid_samples.append(day_idx)
 
         return valid_samples
 
@@ -522,22 +513,23 @@ class MultiModalHydroDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict:
         """
-        Return a sample (max_sequence_length days)
+        Return a sample (max_sequence_length days) containing all catchments
 
         Returns:
             {
                 'precip': [T, 290, 180],
                 'soil': [T, 290, 180],
                 'temp': [T, 290, 180],
-                'evap': [T],
-                'riverflow': [T],
-                'static_attr': [num_features],
-                'catchment_idx': int,
-                'catchment_id': int,
+                'evap': [num_patches, patch_size, T],
+                'riverflow': [num_patches, patch_size, T],
+                'static_attr': [num_patches, patch_size, stat_dim],
+                'catchment_padding_mask': [num_patches, patch_size],
+                'num_patches': int,
+                'patch_size': int,
                 'start_date': datetime,
             }
         """
-        catchment_idx, start_day_idx = self.valid_samples[idx]
+        start_day_idx = self.valid_samples[idx]
         end_day_idx = start_day_idx + self.max_sequence_length
 
         # Get date range
@@ -636,7 +628,5 @@ class MultiModalHydroDataset(Dataset):
             'catchment_padding_mask': padding_mask,  # [num_patches, patch_size]
             'num_patches': num_patches,
             'patch_size': patch_size,
-            'catchment_idx': catchment_idx,
-            'catchment_id': self.catchment_ids[catchment_idx],
             'start_date': date_range[0],
         }

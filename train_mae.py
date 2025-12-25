@@ -26,7 +26,7 @@ from torch.utils.data.distributed import DistributedSampler
 sys.path.insert(0, os.path.abspath('.'))
 
 from models.multimodal_mae import MultiModalMAE
-from datasets.multimodal_dataset import MultiModalHydroDataset
+from datasets.multimodal_dataset_optimized import MultiModalHydroDatasetOptimized
 from datasets.data_utils import load_vector_data_from_parquet
 from datasets.collate import MultiScaleMaskedCollate
 from configs.mae_config import MAEConfig
@@ -157,17 +157,13 @@ def create_datasets(config, rank):
     )
 
     if use_merged and rank == 0:
-        print("✓ Found merged h5 files - using OPTIMIZED mode")
+        print("✓ Found merged h5 files - using ULTRA-OPTIMIZED mode with pre-normalization")
 
-    train_dataset = MultiModalHydroDataset(
-        # Merged h5 files (if available)
-        precip_h5=config.precip_train_h5 if use_merged else None,
-        soil_h5=config.soil_train_h5 if use_merged else None,
-        temp_h5=config.temp_train_h5 if use_merged else None,
-        # Fallback to directory mode
-        precip_dir=None if use_merged else config.precip_dir,
-        soil_dir=None if use_merged else config.soil_dir,
-        temp_dir=None if use_merged else config.temp_dir,
+    train_dataset = MultiModalHydroDatasetOptimized(
+        # Merged h5 files
+        precip_h5=config.precip_train_h5 if use_merged else config.precip_train_h5,
+        soil_h5=config.soil_train_h5 if use_merged else config.soil_train_h5,
+        temp_h5=config.temp_train_h5 if use_merged else config.temp_train_h5,
         # Vector data
         evap_data=evap_data[:, :train_end_idx],
         riverflow_data=riverflow_data[:, :train_end_idx],
@@ -180,9 +176,10 @@ def create_datasets(config, rank):
         catchment_ids=catchment_ids,
         stats_cache_path=config.stats_cache_path,
         land_mask_path=config.land_mask_path,
+        patch_size=config.vector_patch_size,  # NEW: Vector patch size
         split='train',
         # Performance optimization
-        cache_to_memory=config.cache_images_to_memory if hasattr(config, 'cache_images_to_memory') else False,
+        cache_to_memory=config.cache_images_to_memory if hasattr(config, 'cache_images_to_memory') else True,
     )
 
     # Validation dataset
@@ -191,15 +188,11 @@ def create_datasets(config, rank):
         print("Creating validation dataset...")
         print("=" * 60)
 
-    val_dataset = MultiModalHydroDataset(
-        # Merged h5 files (if available)
-        precip_h5=config.precip_val_h5 if use_merged else None,
-        soil_h5=config.soil_val_h5 if use_merged else None,
-        temp_h5=config.temp_val_h5 if use_merged else None,
-        # Fallback to directory mode
-        precip_dir=None if use_merged else config.precip_dir,
-        soil_dir=None if use_merged else config.soil_dir,
-        temp_dir=None if use_merged else config.temp_dir,
+    val_dataset = MultiModalHydroDatasetOptimized(
+        # Merged h5 files
+        precip_h5=config.precip_val_h5 if use_merged else config.precip_val_h5,
+        soil_h5=config.soil_val_h5 if use_merged else config.soil_val_h5,
+        temp_h5=config.temp_val_h5 if use_merged else config.temp_val_h5,
         # Vector data
         evap_data=evap_data[:, train_end_idx:],
         riverflow_data=riverflow_data[:, train_end_idx:],
@@ -212,9 +205,10 @@ def create_datasets(config, rank):
         catchment_ids=catchment_ids,
         stats_cache_path=config.stats_cache_path,
         land_mask_path=config.land_mask_path,
+        patch_size=config.vector_patch_size,  # NEW: Vector patch size
         split='val',
         # Performance optimization
-        cache_to_memory=config.cache_images_to_memory if hasattr(config, 'cache_images_to_memory') else False,
+        cache_to_memory=config.cache_images_to_memory if hasattr(config, 'cache_images_to_memory') else True,
     )
 
     if rank == 0:
