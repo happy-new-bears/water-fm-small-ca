@@ -403,18 +403,36 @@ def train_epoch(model, train_loader, epoch, config, rank, world_size, wandb):
 
 
 def validate(model, val_loader, epoch, config, rank, world_size, wandb):
-    """Validation"""
+    """
+    Validation with detailed metrics logging
+
+    Records:
+    - Total validation loss
+    - Individual modality losses (precip, soil, temp, evap, riverflow)
+    - Performance metrics (time, throughput, batch time)
+    """
 
     model.eval()
 
     # Start timing
     val_start_time = time.time()
+    batch_times = []
 
+    # Initialize loss accumulators
     epoch_loss = torch.tensor(0.0, device=f'cuda:{rank}')
+    epoch_losses = {
+        'precip_loss': torch.tensor(0.0, device=f'cuda:{rank}'),
+        'soil_loss': torch.tensor(0.0, device=f'cuda:{rank}'),
+        'temp_loss': torch.tensor(0.0, device=f'cuda:{rank}'),
+        'evap_loss': torch.tensor(0.0, device=f'cuda:{rank}'),
+        'riverflow_loss': torch.tensor(0.0, device=f'cuda:{rank}'),
+    }
     size = torch.tensor(0, device=f'cuda:{rank}')
 
     with torch.no_grad():
-        for batch in val_loader:
+        for batch_idx, batch in enumerate(val_loader):
+            batch_start_time = time.time()
+
             # Move batch to device and convert to FP16 if needed
             batch_gpu = {}
             for k, v in batch.items():
@@ -430,32 +448,59 @@ def validate(model, val_loader, epoch, config, rank, world_size, wandb):
             # Forward pass
             total_loss, loss_dict = model(batch_gpu)
 
-            # Accumulate
+            # Accumulate total loss
             batch_size = batch_gpu['precip'].size(0)
             epoch_loss += total_loss.item() * batch_size
+
+            # Accumulate individual modality losses
+            for key in epoch_losses.keys():
+                epoch_losses[key] += loss_dict[key].item() * batch_size
+
             size += batch_size
 
-    # Synchronize
+            # Record batch time
+            batch_time = time.time() - batch_start_time
+            batch_times.append(batch_time)
+
+    # Synchronize losses across all processes
     dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
     dist.all_reduce(size, op=dist.ReduceOp.SUM)
+    for key in epoch_losses.keys():
+        dist.all_reduce(epoch_losses[key], op=dist.ReduceOp.SUM)
 
+    # Calculate averages
     avg_loss = epoch_loss.item() / size.item()
+    avg_losses = {key: val.item() / size.item() for key, val in epoch_losses.items()}
 
-    # Calculate timing
+    # Calculate timing and performance statistics
     val_time = time.time() - val_start_time
+    avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
+    samples_per_sec = size.item() / val_time if val_time > 0 else 0
 
-    # Log (rank 0 only)
+    # Log to console (rank 0 only)
     if rank == 0:
         print(f"\nEpoch {epoch+1} Validation Results:")
         print(f"  Average Loss: {avg_loss:.4f}")
+        for key, value in avg_losses.items():
+            print(f"  {key}: {value:.4f}")
         print(f"  Validation Time: {val_time:.2f}s ({val_time/60:.2f}m)")
+        print(f"  Avg Batch Time: {avg_batch_time:.3f}s")
+        print(f"  Throughput: {samples_per_sec:.2f} samples/sec")
 
+        # Log to WandB
         if wandb is not None:
-            wandb.log({
+            log_dict = {
                 'epoch': epoch + 1,
                 'val/loss': avg_loss,
                 'val/time': val_time,
-            })
+                'val/avg_batch_time': avg_batch_time,
+                'val/samples_per_sec': samples_per_sec,
+            }
+            # Add individual modality losses
+            for key, value in avg_losses.items():
+                log_dict[f'val/{key}'] = value
+
+            wandb.log(log_dict)
 
     return avg_loss
 
