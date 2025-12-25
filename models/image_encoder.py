@@ -135,90 +135,82 @@ class ImageModalityEncoder(nn.Module):
         patches = patches[:, :, self.valid_patch_indices, :]  # [B, T, num_valid, 100]
         patch_mask_valid = patch_mask[:, :, self.valid_patch_indices]  # [B, T, num_valid]
 
-        # ===== Step 3: Remove masked patches (MAE strategy) =====
-        # Collect visible patches across batch and time
-        visible_patches_list = []
-        visible_positions_list = []  # (time_idx, patch_idx) pairs
-        lengths = []
+        # ===== Step 3: VECTORIZED selection of visible patches (NO LOOPS!) =====
+        # Get visibility mask (True = visible)
+        visible_mask = ~patch_mask_valid  # [B, T, num_valid]
 
-        for b in range(B):
-            sample_patches = []
-            sample_positions = []
+        # Select visible patches using boolean indexing
+        # This flattens the selected patches into [Total_Visible, patch_dim]
+        # PyTorch iterates in row-major order (B, T, N), so order is preserved
+        x_visible = patches[visible_mask]  # [Total_Visible, patch_dim]
 
-            for t in range(T):
-                # Get visible patches at this timestep
-                visible_mask_t = ~patch_mask_valid[b, t]  # True = visible
-                visible_patches_t = patches[b, t, visible_mask_t]  # [num_visible_t, 100]
+        # Calculate number of visible patches per sample
+        num_visible_per_sample = visible_mask.sum(dim=(1, 2))  # [B]
+        max_len = num_visible_per_sample.max().item()
 
-                # Get patch indices
-                visible_patch_indices = torch.where(visible_mask_t)[0]
-
-                sample_patches.append(visible_patches_t)
-
-                # Record positions for spatial PE
-                for patch_idx in visible_patch_indices:
-                    sample_positions.append((t, patch_idx.item()))
-
-            # Concatenate all visible patches for this sample
-            if len(sample_patches) > 0:
-                sample_patches = torch.cat(sample_patches, dim=0)  # [num_visible_total, 100]
-            else:
-                # Edge case: no visible patches (shouldn't happen in practice)
-                sample_patches = torch.zeros(0, self.patch_dim, device=x_img.device, dtype=self.patch_embed.weight.dtype)
-
-            visible_patches_list.append(sample_patches)
-            visible_positions_list.append(sample_positions)
-            lengths.append(len(sample_patches))
-
-        # Pad to max length
-        max_len = max(lengths)
+        # Edge case: no visible patches
         if max_len == 0:
-            # Edge case: no visible patches at all
-            encoder_output = torch.zeros(B, 1, self.d_model, device=x_img.device, dtype=self.patch_embed.weight.dtype)  # [B, 1, d_model]
-            padding_mask = torch.ones(B, 1, device=x_img.device, dtype=torch.bool)  # All padding
+            encoder_output = torch.zeros(B, 1, self.d_model, device=x_img.device, dtype=self.patch_embed.weight.dtype)
+            padding_mask = torch.ones(B, 1, device=x_img.device, dtype=torch.bool)
             mask_info = {
                 'mask': patch_mask,
-                'lengths': lengths,
+                'lengths': [0] * B,
                 'padding_mask': padding_mask,
-                'positions': [[] for _ in range(B)],
             }
             return encoder_output, mask_info
 
-        x_padded = torch.zeros(B, max_len, self.patch_dim, device=x_img.device, dtype=self.patch_embed.weight.dtype)
-        positions_padded = []  # Store positions for PE
+        # Check if all samples have same length (should be true with fixed mask ratio)
+        if (num_visible_per_sample == max_len).all():
+            # FAST PATH: All samples have same length, no padding needed!
+            x = x_visible.view(B, max_len, self.patch_dim)
+            padding_mask = torch.zeros(B, max_len, device=x_img.device, dtype=torch.bool)
+            lengths = [max_len] * B
+        else:
+            # SLOW PATH: Different lengths, need padding (shouldn't happen with fixed mask ratio)
+            x = torch.zeros(B, max_len, self.patch_dim, device=x_img.device, dtype=patches.dtype)
+            padding_mask = torch.zeros(B, max_len, device=x_img.device, dtype=torch.bool)
+            lengths = num_visible_per_sample.cpu().tolist()
 
-        for b in range(B):
-            x_padded[b, :lengths[b]] = visible_patches_list[b].to(dtype=self.patch_embed.weight.dtype)
-            positions_padded.append(visible_positions_list[b])
-
-        # Create padding mask
-        padding_mask = torch.zeros(B, max_len, device=x_img.device, dtype=torch.bool)
-        for b in range(B):
-            if lengths[b] < max_len:
-                padding_mask[b, lengths[b]:] = True
+            # Fill in the data
+            offset = 0
+            for b in range(B):
+                length = lengths[b]
+                x[b, :length] = x_visible[offset:offset+length]
+                if length < max_len:
+                    padding_mask[b, length:] = True
+                offset += length
 
         # ===== Step 4: Patch embedding =====
-        x = self.patch_embed(x_padded)  # [B, max_len, d_model]
+        x = self.patch_embed(x)  # [B, max_len, d_model]
 
-        # ===== Step 5: Add position embeddings =====
-        # Spatial PE: Add based on patch position
-        for b in range(B):
-            for i, (t_idx, patch_idx) in enumerate(positions_padded[b]):
-                x[b, i] += self.spatial_pos[0, patch_idx]
+        # ===== Step 5: VECTORIZED position embeddings (NO LOOPS!) =====
+        num_valid = self.valid_patch_indices.shape[0]
 
-        # Temporal PE: Add based on time position
-        # Create temporal indices tensor
-        temporal_indices = torch.zeros(B, max_len, device=x_img.device, dtype=torch.long)
-        for b in range(B):
-            for i, (t_idx, patch_idx) in enumerate(positions_padded[b]):
-                temporal_indices[b, i] = t_idx
+        # Create grids of indices [B, T, num_valid]
+        # Temporal indices: [[0,0...], [1,1...], ...] repeated for B
+        t_indices = torch.arange(T, device=x_img.device).view(1, T, 1).expand(B, T, num_valid)
 
-        # Apply temporal PE
+        # Spatial indices: [[0, 1, 2...], [0, 1, 2...]] repeated for B and T
+        # Note: These are indices into the valid_patches array (0..93), not original 0..521
+        s_indices = torch.arange(num_valid, device=x_img.device).view(1, 1, num_valid).expand(B, T, num_valid)
+
+        # Select indices for visible patches
+        t_visible = t_indices[visible_mask].view(B, -1)  # [B, max_len]
+        s_visible = s_indices[visible_mask].view(B, -1)  # [B, max_len]
+
+        # Gather spatial PE: self.spatial_pos is [1, num_valid, d_model]
+        # We need to select from second dimension using s_visible
+        # spatial_emb: [B, max_len, d_model]
+        spatial_emb = self.spatial_pos[0, s_visible.view(-1)].view(B, max_len, -1)
+
+        # Gather temporal PE: self.temporal_pos.pe is [1, max_time, d_model]
+        # We need to select from second dimension using t_visible
+        # temporal_emb: [B, max_len, d_model]
         temporal_pe = self.temporal_pos.pe.squeeze(0)  # [max_time, d_model]
-        for b in range(B):
-            for i in range(lengths[b]):
-                t_idx = temporal_indices[b, i]
-                x[b, i] += temporal_pe[t_idx]
+        temporal_emb = temporal_pe[t_visible.view(-1)].view(B, max_len, -1)
+
+        # Add both PEs to x (vectorized!)
+        x = x + spatial_emb + temporal_emb
 
         # ===== Step 6: Transformer encoder =====
         if self.use_weighted_fm:
@@ -242,7 +234,6 @@ class ImageModalityEncoder(nn.Module):
                 'mask': patch_mask,
                 'lengths': lengths,
                 'padding_mask': padding_mask,
-                'positions': positions_padded,
             }
 
             return x_feats, mask_info  # List of [B, L_visible, d_model]
@@ -259,7 +250,6 @@ class ImageModalityEncoder(nn.Module):
                 'mask': patch_mask,
                 'lengths': lengths,
                 'padding_mask': padding_mask,
-                'positions': positions_padded,
             }
 
             return x, mask_info  # [B, L_visible, d_model]
