@@ -30,27 +30,19 @@ class MAEConfig:
     use_fm_layers = None  # Which encoder layers to use: [0, 2, 4, 5] or None (all)
     use_input = False  # Include input as layer 0
 
-    # ========== Spatial Aggregation Configuration (NEW) ==========
-    # For reducing 604 catchments to K spatial patches (10×10 grid = 100 patches)
-    use_spatial_agg = False  # Enable spatial aggregation for vector modalities
-    spatial_patches_file = 'data/spatial_patches_10x10.pt'  # Path to pre-computed spatial patches
-    # File should contain:
-    #   - patch_assignments: [num_catchments] - patch ID for each catchment
-    #   - catchment_areas: [num_catchments] - area of each catchment
-    #   - num_patches: int - total number of patches (e.g., 100 for 10×10 grid)
-
     # Image patch settings
     patch_size = 10  # Patch size for images (10x10)
     image_height = 290  # Image height
     image_width = 180  # Image width
 
     # Sequence settings
-    max_time_steps = 90  # Maximum sequence length (days)
+    max_time_steps = 30  # Maximum sequence length (days)
     static_attr_dim = 11  # Number of static attributes
 
     # ========== Data Configuration ==========
     # Data root directory
     data_root = '/Users/transformer/Desktop/water_data/new_version'
+    #data_root = '../../new_version'
 
     # Data paths (relative to data_root)
     precip_dir = f'{data_root}/precipitation_processed'
@@ -76,8 +68,23 @@ class MAEConfig:
     val_end = '2015-12-30'  # Data ends on 2015-12-30, not 2015-12-31
 
     # Dataset settings
-    stride = 60  # Stride for sliding window sampling (days)
+    stride = 20  # Stride for sliding window sampling (days)
     stats_cache_path = 'cache/normalization_stats.pt'
+
+    # ========== Merged H5 Files (优化后) ==========
+    # Training period h5 files
+    precip_train_h5 = f'{data_root}/precipitation_train_1989_2010.h5'
+    soil_train_h5 = f'{data_root}/soil_moisture_train_1989_2010.h5'
+    temp_train_h5 = f'{data_root}/temperature_train_1989_2010.h5'
+
+    # Validation period h5 files
+    precip_val_h5 = f'{data_root}/precipitation_val_2011_2015.h5'
+    soil_val_h5 = f'{data_root}/soil_moisture_val_2011_2015.h5'
+    temp_val_h5 = f'{data_root}/temperature_val_2011_2015.h5'
+
+    # Performance optimization
+    cache_images_to_memory = True  # 是否缓存图像到内存
+    num_workers = 12  # 增加workers（原来是4）
 
     # ========== Mask Configuration (可调节的超参数) ==========
     image_mask_ratio = 0.4  # Ratio of patches to mask for image modalities
@@ -86,15 +93,15 @@ class MAEConfig:
 
     # ========== Training Hyperparameters ==========
     # Optimization
-    batch_size = 8  # Batch size per GPU
+    batch_size = 16  # Batch size per GPU
     learning_rate = 1e-4  # Learning rate
     weight_decay = 0.05  # Weight decay
     betas = (0.9, 0.95)  # Adam betas
     eps = 1e-8  # Adam epsilon
 
     # Training schedule
-    epochs = 1000  # Total number of epochs
-    warmup_epochs = 40  # Number of warmup epochs
+    epochs = 10  # Total number of epochs
+    warmup_epochs = 5  # Number of warmup epochs
     min_lr = 0.0  # Minimum learning rate after decay
 
     # ========== Distributed Training ==========
@@ -102,7 +109,7 @@ class MAEConfig:
     zero_stage = 1  # DeepSpeed ZeRO optimization stage
     use_fp16 = True  # Use mixed precision training (FP16)
     gradient_accumulation_steps = 1  # Gradient accumulation steps
-    num_workers = 4  # Number of data loading workers
+    # num_workers is now defined in Performance optimization section above
 
     # ========== Logging and Checkpointing ==========
     # WandB settings

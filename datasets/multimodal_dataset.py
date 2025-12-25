@@ -32,19 +32,23 @@ class MultiModalHydroDataset(Dataset):
 
     def __init__(
         self,
-        # Image modality paths
-        precip_dir: str,
-        soil_dir: str,
-        temp_dir: str,
+        # Image modality paths (legacy mode)
+        precip_dir: Optional[str] = None,
+        soil_dir: Optional[str] = None,
+        temp_dir: Optional[str] = None,
+        # Merged h5 files (optimized mode) - takes priority if provided
+        precip_h5: Optional[str] = None,
+        soil_h5: Optional[str] = None,
+        temp_h5: Optional[str] = None,
         # Vector modality data (pre-loaded)
-        evap_data: np.ndarray,  # [num_catchments, num_days]
-        riverflow_data: np.ndarray,  # [num_catchments, num_days]
+        evap_data: np.ndarray = None,  # [num_catchments, num_days]
+        riverflow_data: np.ndarray = None,  # [num_catchments, num_days]
         # Static attributes
-        static_attr_file: str,
-        static_attr_vars: List[str],
+        static_attr_file: str = None,
+        static_attr_vars: List[str] = None,
         # Time range
-        start_date: str,  # 'YYYY-MM-DD'
-        end_date: str,  # 'YYYY-MM-DD'
+        start_date: str = None,  # 'YYYY-MM-DD'
+        end_date: str = None,  # 'YYYY-MM-DD'
         # Sampling parameters
         max_sequence_length: int = 90,  # Maximum sequence length to return
         stride: int = 30,  # Stride for sliding window sampling (days)
@@ -55,13 +59,36 @@ class MultiModalHydroDataset(Dataset):
         land_mask_path: Optional[str] = None,
         # Other
         split: str = 'train',  # 'train'/'val'/'test'
+        # Performance optimization
+        cache_to_memory: bool = False,  # Cache merged h5 data to memory (fastest)
     ):
         super().__init__()
 
-        # Save parameters
-        self.precip_dir = Path(precip_dir)
-        self.soil_dir = Path(soil_dir)
-        self.temp_dir = Path(temp_dir)
+        # Determine mode: merged h5 (optimized) or directory mode (legacy)
+        self.use_merged = (precip_h5 is not None and soil_h5 is not None and temp_h5 is not None)
+        self.cache_to_memory = cache_to_memory
+
+        if self.use_merged:
+            print(f"\n{'='*60}")
+            print("Using OPTIMIZED mode (merged h5 files)")
+            print(f"{'='*60}")
+            self.precip_h5 = precip_h5
+            self.soil_h5 = soil_h5
+            self.temp_h5 = temp_h5
+            self.image_data = {}  # Will store loaded data
+        else:
+            print(f"\n{'='*60}")
+            print("Using LEGACY mode (directory-based h5 files)")
+            print(f"{'='*60}")
+            if precip_dir is None or soil_dir is None or temp_dir is None:
+                raise ValueError(
+                    "Either provide (precip_h5, soil_h5, temp_h5) for optimized mode, "
+                    "or (precip_dir, soil_dir, temp_dir) for legacy mode"
+                )
+            self.precip_dir = Path(precip_dir)
+            self.soil_dir = Path(soil_dir)
+            self.temp_dir = Path(temp_dir)
+
         self.max_sequence_length = max_sequence_length
         self.stride = stride
         self.split = split
@@ -93,8 +120,12 @@ class MultiModalHydroDataset(Dataset):
         self.evap_data = evap_data  # [num_catchments, num_days]
         self.riverflow_data = riverflow_data  # [num_catchments, num_days]
 
-        # Scan h5 files
-        self.h5_file_map = self._scan_h5_files()
+        # Load image data
+        if self.use_merged:
+            self._load_merged_h5()
+        else:
+            # Scan h5 files (legacy mode)
+            self.h5_file_map = self._scan_h5_files()
 
         # Load static attributes
         self.static_attrs = self._load_static_attributes(
@@ -183,6 +214,48 @@ class MultiModalHydroDataset(Dataset):
               f"soil={len(file_map['soil'])}, temp={len(file_map['temp'])}")
 
         return file_map
+
+    def _load_merged_h5(self):
+        """
+        Load merged h5 files (optimized mode)
+
+        Loads data from pre-merged h5 files, optionally caching to memory
+        """
+        modality_files = {
+            'precip': self.precip_h5,
+            'soil': self.soil_h5,
+            'temp': self.temp_h5,
+        }
+
+        for modality, h5_path in modality_files.items():
+            if not os.path.exists(h5_path):
+                raise FileNotFoundError(
+                    f"Merged h5 file not found: {h5_path}\n"
+                    f"Please ensure the merged files exist or use legacy mode with directory paths."
+                )
+
+            print(f"\nLoading {modality} from {h5_path}...")
+
+            with h5py.File(h5_path, 'r') as f:
+                if self.cache_to_memory:
+                    # Cache to memory (fastest)
+                    print(f"  Caching to memory...")
+                    data = f['data'][:]  # Load all data to RAM
+                    print(f"  ✓ Cached: {data.shape}, {data.nbytes / (1024**2):.2f} MB")
+                    self.image_data[modality] = data
+                else:
+                    # Keep h5py file handle open (slower but uses less memory)
+                    # Re-open file and keep it open
+                    self._h5_handles = getattr(self, '_h5_handles', {})
+                    self._h5_handles[modality] = h5py.File(h5_path, 'r')
+                    self.image_data[modality] = self._h5_handles[modality]['data']
+                    print(f"  ✓ File opened (on-demand loading)")
+
+        if self.cache_to_memory:
+            print(f"\n✓ All image data cached to memory (fastest mode)")
+        else:
+            print(f"\n✓ Using on-demand loading (slower but less memory)")
+            print(f"  💡 Tip: Set cache_to_memory=True for 10-100x speedup")
 
     def _load_static_attributes(
         self,
@@ -438,6 +511,15 @@ class MultiModalHydroDataset(Dataset):
     def __len__(self) -> int:
         return len(self.valid_samples)
 
+    def __del__(self):
+        """Clean up h5 file handles if they were kept open"""
+        if hasattr(self, '_h5_handles'):
+            for modality, handle in self._h5_handles.items():
+                try:
+                    handle.close()
+                except:
+                    pass
+
     def __getitem__(self, idx: int) -> Dict:
         """
         Return a sample (max_sequence_length days)
@@ -462,9 +544,16 @@ class MultiModalHydroDataset(Dataset):
         date_range = self.date_list[start_day_idx:end_day_idx]
 
         # Load image sequences
-        precip_seq = self._load_image_sequence('precip', date_range)
-        soil_seq = self._load_image_sequence('soil', date_range)
-        temp_seq = self._load_image_sequence('temp', date_range)
+        if self.use_merged:
+            # Optimized: Direct array slicing (10-100x faster!)
+            precip_seq = self.image_data['precip'][start_day_idx:end_day_idx]
+            soil_seq = self.image_data['soil'][start_day_idx:end_day_idx]
+            temp_seq = self.image_data['temp'][start_day_idx:end_day_idx]
+        else:
+            # Legacy: Load from multiple h5 files
+            precip_seq = self._load_image_sequence('precip', date_range)
+            soil_seq = self._load_image_sequence('soil', date_range)
+            temp_seq = self._load_image_sequence('temp', date_range)
 
         # Normalize images
         precip_norm = self._normalize_image(precip_seq, 'precip')

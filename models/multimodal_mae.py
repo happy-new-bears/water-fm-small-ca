@@ -14,7 +14,6 @@ from .vector_encoder import VectorModalityEncoder
 from .image_decoder import ImageModalityDecoder
 from .vector_decoder import VectorModalityDecoder
 from .layers import patchify, unpatchify
-from .spatial_aggregation import SpatialAggregation
 
 
 class MultiModalMAE(nn.Module):
@@ -49,43 +48,6 @@ class MultiModalMAE(nn.Module):
                 'valid_patch_indices',
                 torch.arange(num_patches, dtype=torch.long)
             )
-
-        # ========== Spatial Aggregation (NEW) ==========
-        # Load pre-computed spatial patches if enabled
-        spatial_agg_module = None
-        if config.use_spatial_agg:
-            print(f"Loading spatial patches from: {config.spatial_patches_file}")
-
-            if not os.path.exists(config.spatial_patches_file):
-                raise FileNotFoundError(
-                    f"Spatial patches file not found: {config.spatial_patches_file}\n"
-                    f"Please run: python utils/create_spatial_patches.py"
-                )
-
-            spatial_data = torch.load(config.spatial_patches_file)
-            patch_assignments = spatial_data['patch_assignments']
-            catchment_areas = spatial_data['catchment_areas']
-            num_catchments = spatial_data['num_catchments']
-            num_patches = spatial_data['num_patches']
-
-            print(f"  Catchments: {num_catchments}")
-            print(f"  Spatial patches: {num_patches}")
-            print(f"  Grid size: {spatial_data.get('grid_size', 'unknown')}")
-
-            # Create SpatialAggregation module
-            spatial_agg_module = SpatialAggregation(
-                num_catchments=num_catchments,
-                num_patches=num_patches,
-                patch_assignments=patch_assignments,
-                catchment_areas=catchment_areas,
-                aggregation_mode='fixed',  # Use fixed area-weighted aggregation
-            )
-
-            # Print statistics
-            patch_info = spatial_agg_module.get_patch_info()
-            print(f"  Non-empty patches: {patch_info['num_non_empty_patches']}")
-            print(f"  Token reduction: {num_catchments} -> {num_patches} "
-                  f"({(1 - num_patches/num_catchments)*100:.1f}% reduction)")
 
         # ========== Image Encoders ==========
         self.precip_encoder = ImageModalityEncoder(
@@ -142,8 +104,6 @@ class MultiModalMAE(nn.Module):
             use_weighted_fm=config.use_weighted_fm,  # Phase 2
             use_fm_layers=config.use_fm_layers,      # Phase 2
             use_input=config.use_input,              # Phase 2
-            use_spatial_agg=config.use_spatial_agg,  # NEW: Spatial aggregation
-            spatial_agg_module=spatial_agg_module,   # NEW: Pass spatial agg module
         )
 
         self.riverflow_encoder = VectorModalityEncoder(
@@ -157,8 +117,6 @@ class MultiModalMAE(nn.Module):
             use_weighted_fm=config.use_weighted_fm,  # Phase 2
             use_fm_layers=config.use_fm_layers,      # Phase 2
             use_input=config.use_input,              # Phase 2
-            use_spatial_agg=config.use_spatial_agg,  # NEW: Spatial aggregation
-            spatial_agg_module=spatial_agg_module,   # NEW: Pass spatial agg module
         )
 
         # ========== Image Decoders ==========
@@ -222,7 +180,6 @@ class MultiModalMAE(nn.Module):
             decoder_self_attn=config.decoder_self_attn,
             use_weighted_fm=config.use_weighted_fm,  # Phase 2
             num_encoder_layers=config.vec_encoder_layers,  # Phase 2
-            spatial_agg_module=spatial_agg_module,  # NEW: Spatial aggregation
         )
 
         self.riverflow_decoder = VectorModalityDecoder(
@@ -236,7 +193,6 @@ class MultiModalMAE(nn.Module):
             decoder_self_attn=config.decoder_self_attn,
             use_weighted_fm=config.use_weighted_fm,  # Phase 2
             num_encoder_layers=config.vec_encoder_layers,  # Phase 2
-            spatial_agg_module=spatial_agg_module,  # NEW: Spatial aggregation
         )
 
     def forward(self, batch: Dict) -> Tuple[Tensor, Dict[str, Tensor]]:

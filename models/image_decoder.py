@@ -187,36 +187,42 @@ class ImageModalityDecoder(nn.Module):
             # encoder_output: [B, L_visible, encoder_dim]
             encoder_features_per_layer = None
 
-        # ===== Step 1: Create masked queries =====
+        # ===== Step 1: Create masked queries (VECTORIZED) =====
         # Only for masked positions (TRUE = masked)
-        masked_queries_list = []
-        masked_positions_list = []  # Store (b, t, p) for reconstruction
 
-        for b in range(B):
-            for t in range(T):
-                for p in range(num_patches):
-                    if mask[b, t, p]:  # True = masked
-                        # Query = mask_token + spatial_pos + temporal_pos
-                        query = self.mask_token.squeeze(0).clone()  # [decoder_dim]
-                        query = query + self.spatial_pos[0, p]  # Add spatial PE
+        # Find all masked positions using vectorized operation
+        masked_indices = mask.nonzero(as_tuple=False)  # [N, 3] where N = total masked patches
+        # masked_indices[:, 0] = batch indices
+        # masked_indices[:, 1] = time indices
+        # masked_indices[:, 2] = patch indices
 
-                        # Store for temporal PE (will add later in batch)
-                        masked_queries_list.append(query)
-                        masked_positions_list.append((b, t, p))
+        num_masked = masked_indices.shape[0]
 
-        if len(masked_queries_list) == 0:
+        if num_masked == 0:
             # Edge case: no masked patches
-            return torch.zeros(B, T, num_patches, self.patch_dim,
-                             device=encoder_output.device if not isinstance(encoder_output, list) else encoder_output[0].device,
-                             dtype=encoder_output.dtype if not isinstance(encoder_output, list) else encoder_output[0].dtype)
+            device = encoder_output.device if not isinstance(encoder_output, list) else encoder_output[0].device
+            dtype = encoder_output.dtype if not isinstance(encoder_output, list) else encoder_output[0].dtype
+            return torch.zeros(B, T, num_patches, self.patch_dim, device=device, dtype=dtype)
 
-        # Stack queries: [total_masked, decoder_dim]
-        queries = torch.stack(masked_queries_list, dim=0)
+        # Vectorized query creation
+        # Start with mask tokens: [N, decoder_dim]
+        queries = self.mask_token.expand(num_masked, -1).clone()
 
-        # Add temporal positional encoding
+        # Add spatial positional encoding (vectorized)
+        # self.spatial_pos: [1, num_patches, decoder_dim]
+        # Extract spatial PE for each masked patch
+        spatial_pe = self.spatial_pos[0, masked_indices[:, 2], :]  # [N, decoder_dim]
+        queries = queries + spatial_pe
+
+        # Add temporal positional encoding (vectorized)
         temporal_pe = self.temporal_pos.pe.squeeze(0)  # [max_time, decoder_dim]
-        for i, (b, t, p) in enumerate(masked_positions_list):
-            queries[i] = queries[i] + temporal_pe[t]
+        # Extract temporal PE for each masked patch
+        temporal_pe_selected = temporal_pe[masked_indices[:, 1], :]  # [N, decoder_dim]
+        queries = queries + temporal_pe_selected
+
+        # Store positions for later reconstruction
+        masked_positions_list = [(b.item(), t.item(), p.item())
+                                for b, t, p in masked_indices]
 
         # Reshape for batch processing: [B, total_masked, decoder_dim]
         # But we need to process per-batch because each query should only

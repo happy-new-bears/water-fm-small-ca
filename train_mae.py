@@ -148,10 +148,27 @@ def create_datasets(config, rank):
         print("Creating training dataset...")
         print("=" * 60)
 
+    # Check if merged h5 files exist
+    use_merged = (
+        hasattr(config, 'precip_train_h5') and
+        hasattr(config, 'soil_train_h5') and
+        hasattr(config, 'temp_train_h5') and
+        os.path.exists(config.precip_train_h5)
+    )
+
+    if use_merged and rank == 0:
+        print("✓ Found merged h5 files - using OPTIMIZED mode")
+
     train_dataset = MultiModalHydroDataset(
-        precip_dir=config.precip_dir,
-        soil_dir=config.soil_dir,
-        temp_dir=config.temp_dir,
+        # Merged h5 files (if available)
+        precip_h5=config.precip_train_h5 if use_merged else None,
+        soil_h5=config.soil_train_h5 if use_merged else None,
+        temp_h5=config.temp_train_h5 if use_merged else None,
+        # Fallback to directory mode
+        precip_dir=None if use_merged else config.precip_dir,
+        soil_dir=None if use_merged else config.soil_dir,
+        temp_dir=None if use_merged else config.temp_dir,
+        # Vector data
         evap_data=evap_data[:, :train_end_idx],
         riverflow_data=riverflow_data[:, :train_end_idx],
         static_attr_file=config.static_attr_file,
@@ -164,6 +181,8 @@ def create_datasets(config, rank):
         stats_cache_path=config.stats_cache_path,
         land_mask_path=config.land_mask_path,
         split='train',
+        # Performance optimization
+        cache_to_memory=config.cache_images_to_memory if hasattr(config, 'cache_images_to_memory') else False,
     )
 
     # Validation dataset
@@ -173,9 +192,15 @@ def create_datasets(config, rank):
         print("=" * 60)
 
     val_dataset = MultiModalHydroDataset(
-        precip_dir=config.precip_dir,
-        soil_dir=config.soil_dir,
-        temp_dir=config.temp_dir,
+        # Merged h5 files (if available)
+        precip_h5=config.precip_val_h5 if use_merged else None,
+        soil_h5=config.soil_val_h5 if use_merged else None,
+        temp_h5=config.temp_val_h5 if use_merged else None,
+        # Fallback to directory mode
+        precip_dir=None if use_merged else config.precip_dir,
+        soil_dir=None if use_merged else config.soil_dir,
+        temp_dir=None if use_merged else config.temp_dir,
+        # Vector data
         evap_data=evap_data[:, train_end_idx:],
         riverflow_data=riverflow_data[:, train_end_idx:],
         static_attr_file=config.static_attr_file,
@@ -188,6 +213,8 @@ def create_datasets(config, rank):
         stats_cache_path=config.stats_cache_path,
         land_mask_path=config.land_mask_path,
         split='val',
+        # Performance optimization
+        cache_to_memory=config.cache_images_to_memory if hasattr(config, 'cache_images_to_memory') else False,
     )
 
     if rank == 0:

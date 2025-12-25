@@ -8,7 +8,6 @@ from torch import Tensor
 from typing import Dict, Optional
 
 from .layers import PositionalEncoding, CrossAttentionBlock, WeightedFeatureMaps
-from .spatial_aggregation import SpatialAggregation
 
 
 class VectorModalityDecoder(nn.Module):
@@ -54,7 +53,6 @@ class VectorModalityDecoder(nn.Module):
         decoder_self_attn: bool = False,
         use_weighted_fm: bool = False,  # Phase 2
         num_encoder_layers: int = 4,    # Phase 2
-        spatial_agg_module: Optional[SpatialAggregation] = None,  # NEW: Spatial aggregation
     ):
         super().__init__()
 
@@ -64,7 +62,6 @@ class VectorModalityDecoder(nn.Module):
         self.use_cross_attn = use_cross_attn
         self.use_weighted_fm = use_weighted_fm
         self.num_decoder_layers = num_decoder_layers
-        self.spatial_agg = spatial_agg_module  # NEW: Store for reverse operation
 
         # Mask token (learnable)
         self.mask_token = nn.Parameter(torch.zeros(1, decoder_dim))
@@ -148,50 +145,10 @@ class VectorModalityDecoder(nn.Module):
         - If use_weighted_fm=True, encoder_output is list of features
         - Use WeightedFeatureMaps to combine them
         - Each decoder layer uses different weighted combination
-
-        Spatial Aggregation Support:
-        - If use_spatial_agg=True, encoder_output has shape [B, num_patches, L, d_model]
-        - Process each patch independently
-        - Use spatial_agg.reverse() to aggregate predictions back to catchments
         """
-        mask = mask_info['mask']  # [B, T] or [B, num_patches, T]
-        padding_mask = mask_info.get('padding_mask')  # [B, L_visible] or [B, num_patches, L_visible]
-        use_spatial_agg = mask_info.get('use_spatial_agg', False)
-        num_patches = mask_info.get('num_patches', None)
-
-        if use_spatial_agg:
-            # Spatial aggregation mode
-            # mask: [B, num_patches, T]
-            # encoder_output: [B, num_patches, L, d_model] or list of such
-            B_orig, num_patches, T = mask.shape
-
-            # Reshape to process patches as batch
-            # [B, num_patches, T] -> [B*num_patches, T]
-            mask = mask.reshape(B_orig * num_patches, T)
-            if padding_mask is not None:
-                # [B, num_patches, L] -> [B*num_patches, L]
-                padding_mask = padding_mask.reshape(B_orig * num_patches, -1)
-
-            # Reshape encoder output
-            if self.use_weighted_fm:
-                # encoder_output is list of [B, num_patches, L, d_model]
-                encoder_output_reshaped = []
-                for feat in encoder_output:
-                    B, P, L, D = feat.shape
-                    feat_reshaped = feat.reshape(B * P, L, D)  # [B*num_patches, L, d_model]
-                    encoder_output_reshaped.append(feat_reshaped)
-                encoder_output = encoder_output_reshaped
-            else:
-                # encoder_output: [B, num_patches, L, d_model]
-                B, P, L, D = encoder_output.shape
-                encoder_output = encoder_output.reshape(B * P, L, D)  # [B*num_patches, L, d_model]
-
-            B = B_orig * num_patches  # Effective batch size
-        else:
-            # Standard mode
-            B, T = mask.shape
-            B_orig = B
-            num_patches = None
+        mask = mask_info['mask']  # [B, T]
+        padding_mask = mask_info.get('padding_mask')  # [B, L_visible]
+        B, T = mask.shape
 
         # ===== Phase 2: Process encoder features =====
         if self.use_weighted_fm:
@@ -209,32 +166,34 @@ class VectorModalityDecoder(nn.Module):
             # encoder_output: [B, L_visible, encoder_dim]
             encoder_features_per_layer = None
 
-        # ===== Step 1: Create masked queries =====
+        # ===== Step 1: Create masked queries (VECTORIZED) =====
         # Only for masked timesteps (TRUE = masked)
-        masked_queries_list = []
-        masked_positions_list = []  # Store (b, t) for reconstruction
 
-        for b in range(B):
-            for t in range(T):
-                if mask[b, t]:  # True = masked
-                    # Query = mask_token + temporal_pos
-                    query = self.mask_token.squeeze(0).clone()  # [decoder_dim]
-                    masked_queries_list.append(query)
-                    masked_positions_list.append((b, t))
+        # Find all masked positions using vectorized operation
+        masked_indices = mask.nonzero(as_tuple=False)  # [N, 2] where N = total masked timesteps
+        # masked_indices[:, 0] = batch indices
+        # masked_indices[:, 1] = time indices
 
-        if len(masked_queries_list) == 0:
+        num_masked = masked_indices.shape[0]
+
+        if num_masked == 0:
             # Edge case: no masked timesteps
-            return torch.zeros(B, T,
-                             device=encoder_output.device if not isinstance(encoder_output, list) else encoder_output[0].device,
-                             dtype=encoder_output.dtype if not isinstance(encoder_output, list) else encoder_output[0].dtype)
+            device = encoder_output.device if not isinstance(encoder_output, list) else encoder_output[0].device
+            dtype = encoder_output.dtype if not isinstance(encoder_output, list) else encoder_output[0].dtype
+            return torch.zeros(B, T, device=device, dtype=dtype)
 
-        # Stack queries: [total_masked, decoder_dim]
-        queries = torch.stack(masked_queries_list, dim=0)
+        # Vectorized query creation
+        # Start with mask tokens: [N, decoder_dim]
+        queries = self.mask_token.expand(num_masked, -1).clone()
 
-        # Add temporal positional encoding
+        # Add temporal positional encoding (vectorized)
         temporal_pe = self.temporal_pos.pe.squeeze(0)  # [max_time, decoder_dim]
-        for i, (b, t) in enumerate(masked_positions_list):
-            queries[i] = queries[i] + temporal_pe[t]
+        # Extract temporal PE for each masked timestep
+        temporal_pe_selected = temporal_pe[masked_indices[:, 1], :]  # [N, decoder_dim]
+        queries = queries + temporal_pe_selected
+
+        # Store positions for later reconstruction
+        masked_positions_list = [(b.item(), t.item()) for b, t in masked_indices]
 
         queries = queries.unsqueeze(0)  # [1, total_masked, decoder_dim]
 
@@ -295,29 +254,6 @@ class VectorModalityDecoder(nn.Module):
             for local_idx, global_idx in enumerate(batch_mask_indices):
                 b, t = masked_positions_list[global_idx]
                 pred_vec[b, t] = predictions[0, local_idx]
-
-        # ===== Step 6: Reverse spatial aggregation (if enabled) =====
-        if use_spatial_agg:
-            # pred_vec is [B*num_patches, T] where num_patches = num_non_empty (e.g., 64)
-            # Need to:
-            # 1. Reshape to [B_orig, num_non_empty, T]
-            # 2. Expand to [B_orig, num_patches_total, T] (e.g., 100) by inserting zeros for empty patches
-            # 3. Reverse aggregation: [B_orig, num_patches_total, T] -> [B_orig, num_catchments, T]
-
-            pred_vec = pred_vec.reshape(B_orig, num_patches, T)  # [B_orig, 64, T]
-
-            # 扩展到完整的patch数量（包括empty patches）
-            # 类似image decoder处理invalid patches
-            num_patches_total = self.spatial_agg.num_patches  # 100
-            pred_vec_full = torch.zeros(B_orig, num_patches_total, T,
-                                       device=pred_vec.device, dtype=pred_vec.dtype)
-
-            # 将non-empty patches的预测值填充到对应位置
-            non_empty_indices = self.spatial_agg.non_empty_patch_indices  # [64]
-            pred_vec_full[:, non_empty_indices, :] = pred_vec
-
-            # Reverse aggregation: [B_orig, 100, T] -> [B_orig, num_catchments, T]
-            pred_vec = self.spatial_agg.reverse(pred_vec_full)  # [B_orig, 604, T]
 
         return pred_vec
 
