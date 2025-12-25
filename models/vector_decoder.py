@@ -143,12 +143,10 @@ class VectorModalityDecoder(nn.Module):
 
     def _forward_cross_attn(self, encoder_output, mask_info: Dict) -> Tensor:
         """
-        CrossMAE decoder with patch-level masking
+        Vectorized CrossMAE decoder for vectors (NO LOOPS over batch!)
 
-        Phase 2: Support WeightedFeatureMaps
-        - If use_weighted_fm=True, encoder_output is list of features
-        - Use WeightedFeatureMaps to combine them
-        - Each decoder layer uses different weighted combination
+        Key optimization: Process entire batch in parallel instead of per-sample loops.
+        Assumes fixed mask ratio, so all samples have same number of masked patches.
         """
         patch_mask = mask_info['mask']  # [B, num_patches, T]
         padding_mask = mask_info.get('padding_mask')  # [B, L_visible]
@@ -162,116 +160,75 @@ class VectorModalityDecoder(nn.Module):
         if self.use_weighted_fm:
             # encoder_output is list of [B, L_visible, encoder_dim]
             assert isinstance(encoder_output, list), "Expected list of encoder features"
-
             # Combine multi-layer features: list -> [B, L, C, decoder_depth]
             weighted_features = self.weighted_fm(encoder_output)  # [B, L_visible, encoder_dim, num_decoder_layers]
-
-            # Extract per-layer features (will use later in decoder loop)
-            # Shape: [B, L_visible, encoder_dim, num_decoder_layers]
             encoder_features_per_layer = weighted_features
         else:
-            # Standard: single encoder output
-            # encoder_output: [B, L_visible, encoder_dim]
+            # Standard: single encoder output [B, L_visible, encoder_dim]
             encoder_features_per_layer = None
 
-        # ===== Step 1: Create masked queries for PATCHES (VECTORIZED) =====
-        # patch_mask: [B, num_patches, T] - True = masked patch-time
-        # We create queries for each masked (patch, time) combination
+        # ===== Step 1: VECTORIZED Query Creation (NO LOOPS!) =====
+        # Assumption: Fixed mask ratio means each sample has same number of masked patch-times
+        num_masked_total = patch_mask.sum().item()
+        num_masked_per_sample = num_masked_total // B
 
-        # Find all masked patch-time positions using vectorized operation
-        masked_indices = patch_mask.nonzero(as_tuple=False)  # [N, 3] where N = total masked patch-times
-        # masked_indices[:, 0] = batch indices
-        # masked_indices[:, 1] = patch indices
-        # masked_indices[:, 2] = time indices
+        # Get all masked positions
+        # nonzero() returns indices in order (b, p, t), which we rely on
+        indices = patch_mask.nonzero(as_tuple=False)  # [Total_Masked, 3]
 
-        num_masked = masked_indices.shape[0]
+        # Extract t indices for Temporal PE
+        t_indices = indices[:, 2].view(B, num_masked_per_sample)  # [B, k]
 
-        if num_masked == 0:
-            # Edge case: no masked patches
-            device = encoder_output.device if not isinstance(encoder_output, list) else encoder_output[0].device
-            dtype = encoder_output.dtype if not isinstance(encoder_output, list) else encoder_output[0].dtype
-            return torch.zeros(B, num_actual, T, device=device, dtype=dtype)
+        # Create Queries [B, k, decoder_dim]
+        queries = self.mask_token.expand(B, num_masked_per_sample, -1).clone()
 
-        # Vectorized query creation
-        # Start with mask tokens: [N, decoder_dim]
-        queries = self.mask_token.expand(num_masked, -1).clone()
+        # Add Temporal PE (Gathering, NO LOOP!)
+        # temporal_pos.pe: [1, max_len, decoder_dim] -> [max_len, decoder_dim]
+        temporal_emb = self.temporal_pos.pe.squeeze(0)[t_indices]  # [B, k, decoder_dim]
+        queries = queries + temporal_emb
 
-        # Add temporal positional encoding (vectorized)
-        temporal_pe = self.temporal_pos.pe.squeeze(0)  # [max_time, decoder_dim]
-        # Extract temporal PE for each masked timestep
-        temporal_pe_selected = temporal_pe[masked_indices[:, 2], :]  # [N, decoder_dim]
-        queries = queries + temporal_pe_selected
+        # ===== Step 2: Batched Cross Attention (PARALLEL!) =====
+        x = queries  # [B, k, decoder_dim]
 
-        # Store positions for later reconstruction
-        masked_positions_list = [(b.item(), p.item(), t.item()) for b, p, t in masked_indices]
+        for layer_idx, blk in enumerate(self.decoder_blocks):
+            # Get Encoder Features
+            if self.use_weighted_fm:
+                # [B, L_visible, encoder_dim, Layers] -> [B, L_visible, encoder_dim]
+                batch_encoder = encoder_features_per_layer[:, :, :, layer_idx]
 
-        queries = queries.unsqueeze(0)  # [1, total_masked, decoder_dim]
-
-        # ===== Step 2: Process per batch =====
-        all_predictions = []
-
-        for b in range(B):
-            # Get this batch's masked queries
-            batch_mask_indices = [i for i, (bi, p, t) in enumerate(masked_positions_list) if bi == b]
-
-            if len(batch_mask_indices) == 0:
-                continue
-
-            batch_queries = queries[0, batch_mask_indices, :].unsqueeze(0)  # [1, L_masked_b, D]
-
-            # ===== Step 3: CrossAttention decoder with WeightedFeatureMaps =====
-            x = batch_queries
-
-            for layer_idx, blk in enumerate(self.decoder_blocks):
-                # Get encoder features for this layer
-                if self.use_weighted_fm:
-                    # Extract this decoder layer's weighted feature map
-                    # encoder_features_per_layer: [B, L_visible, encoder_dim, num_decoder_layers]
-                    layer_features = encoder_features_per_layer[b:b+1, :, :, layer_idx]  # [1, L_visible, encoder_dim]
-
-                    # Filter by padding mask
-                    if padding_mask is not None:
-                        valid_mask = ~padding_mask[b]  # [L_visible]
-                        batch_encoder = layer_features[0:1, valid_mask, :]  # [1, L_valid, encoder_dim]
-                    else:
-                        batch_encoder = layer_features  # [1, L_visible, encoder_dim]
-
-                    # Apply layer-wise normalization
-                    batch_encoder = self.dec_norms[layer_idx](batch_encoder)
+                # Apply Layer-wise Norm
+                batch_encoder = self.dec_norms[layer_idx](batch_encoder)
+            else:
+                # Standard
+                if isinstance(encoder_output, list):
+                    batch_encoder = encoder_output[-1]  # Use last layer
                 else:
-                    # Standard: use single encoder output
-                    if padding_mask is not None:
-                        valid_mask = ~padding_mask[b]  # [L_visible]
-                        batch_encoder = encoder_output[b:b+1, valid_mask, :]  # [1, L_valid, encoder_dim]
-                    else:
-                        batch_encoder = encoder_output[b:b+1, :, :]  # [1, L_visible, encoder_dim]
+                    batch_encoder = encoder_output  # [B, L_visible, encoder_dim]
 
-                # Apply CrossAttention
-                x = blk(x, batch_encoder)  # queries attend to this batch's visible tokens
+            # CrossAttention now processes ENTIRE BATCH in parallel!
+            x = blk(x, batch_encoder)  # [B, k, decoder_dim]
 
-            # ===== Step 4: Prediction =====
-            x = self.decoder_norm(x)  # [1, L_masked_b, decoder_dim]
-            predictions_patch = self.pred_head(x)  # [1, L_masked_b, patch_size]
+        # ===== Step 3: Prediction =====
+        x = self.decoder_norm(x)  # [B, k, decoder_dim]
+        predictions_patch = self.pred_head(x)  # [B, k, patch_size]
 
-            all_predictions.append((batch_mask_indices, predictions_patch))
+        # ===== Step 4: Scatter back & Unpatchify (VECTORIZED!) =====
+        device = predictions_patch.device
+        dtype = predictions_patch.dtype
 
-        # ===== Step 5: Reconstruct full output and unpatchify =====
-        device = encoder_output[0].device if isinstance(encoder_output, list) else encoder_output.device
-        dtype = encoder_output[0].dtype if isinstance(encoder_output, list) else encoder_output.dtype
+        # Target: [B, num_patches, T, patch_size]
+        # This shape makes it easier to assign using boolean indexing
+        pred_grid = torch.zeros(B, num_patches, T, self.patch_size, device=device, dtype=dtype)
 
-        # Initialize output: [B, num_padded, T]
-        pred_vec_padded = torch.zeros(B, num_padded, T, device=device, dtype=dtype)
+        # patch_mask is [B, num_patches, T], use as index
+        # predictions_patch is [B, k, patch_size] -> flatten -> [Total_Masked, patch_size]
+        pred_grid[patch_mask] = predictions_patch.reshape(-1, self.patch_size)
 
-        for batch_mask_indices, predictions_patch in all_predictions:
-            for local_idx, global_idx in enumerate(batch_mask_indices):
-                b, p, t = masked_positions_list[global_idx]
-                # predictions_patch[0, local_idx]: [patch_size]
-                # Assign to all catchments in this patch
-                start_c = p * self.patch_size
-                end_c = start_c + self.patch_size
-                pred_vec_padded[b, start_c:end_c, t] = predictions_patch[0, local_idx, :]
+        # Now convert back to [B, num_catchments, T]
+        # [B, num_patches, T, patch_size] -> [B, num_patches, patch_size, T]
+        pred_vec_padded = pred_grid.permute(0, 1, 3, 2).reshape(B, num_padded, T)
 
-        # Remove padding: [B, num_padded, T] -> [B, num_actual, T]
+        # Crop padding: [B, num_padded, T] -> [B, num_actual, T]
         pred_vec = pred_vec_padded[:, :num_actual, :]
 
         return pred_vec

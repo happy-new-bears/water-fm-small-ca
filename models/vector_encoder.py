@@ -135,29 +135,25 @@ class VectorModalityEncoder(nn.Module):
 
         # Check if all samples have same number of visible patches (should be true with fixed mask ratio)
         if (num_visible_per_sample == max_len).all():
-            # FAST PATH: All samples have same length, no need for complex padding logic
-            # Select visible patches directly
-            # We need to select from [B, num_patches, patch_size, T/stat_dim]
-            # This is tricky because each sample has different visible indices
+            # FAST PATH: All samples have same length, VECTORIZED selection!
+            # visible_patch_mask: [B, num_patches] boolean mask
+            # x_vec: [B, num_patches, patch_size, T]
 
-            # Approach: Stack all visible patches, then reshape
-            x_visible_list = []
-            static_visible_list = []
-            for b in range(B):
-                x_visible_list.append(x_vec[b, visible_patch_mask[b]])
-                static_visible_list.append(static_attr[b, visible_patch_mask[b]])
+            # Directly use boolean indexing to select all visible patches (Flat)
+            x_flat = x_vec[visible_patch_mask]  # [Total_Visible, patch_size, T]
+            static_flat = static_attr[visible_patch_mask]  # [Total_Visible, patch_size, stat_dim]
 
-            x_padded = torch.stack(x_visible_list, dim=0)  # [B, max_len, patch_size, T]
-            static_padded = torch.stack(static_visible_list, dim=0)  # [B, max_len, patch_size, stat_dim]
+            # Reshape back to [B, max_len, ...]
+            # FAST PATH guarantees each sample has same number of visible patches
+            x_padded = x_flat.view(B, max_len, patch_size, T)
+            static_padded = static_flat.view(B, max_len, patch_size, -1)
             padding_mask = torch.zeros(B, max_len, device=x_vec.device, dtype=torch.bool)
             lengths = [max_len] * B
 
-            # Also handle catchment_padding_mask
+            # Also handle catchment_padding_mask (VECTORIZED!)
             if catchment_padding_mask is not None:
-                catchment_padding_visible_list = []
-                for b in range(B):
-                    catchment_padding_visible_list.append(catchment_padding_mask[b, visible_patch_mask[b]])
-                catchment_padding_visible = torch.stack(catchment_padding_visible_list, dim=0)  # [B, max_len, patch_size]
+                catchment_padding_flat = catchment_padding_mask[visible_patch_mask]  # [Total_Visible, patch_size]
+                catchment_padding_visible = catchment_padding_flat.view(B, max_len, patch_size)
             else:
                 catchment_padding_visible = torch.zeros(B, max_len, patch_size, device=x_vec.device, dtype=torch.bool)
 
