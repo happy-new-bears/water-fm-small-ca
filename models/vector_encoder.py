@@ -123,62 +123,71 @@ class VectorModalityEncoder(nn.Module):
         # Ensure dtype consistency
         static_attr = static_attr.to(dtype=self.in_proj.weight.dtype)
 
-        # ===== Step 1: Remove masked PATCHES (MAE strategy) =====
+        # ===== Step 1: VECTORIZED visible patch selection (NO LOOPS!) =====
         # Encoder should never see masked patches
-        visible_patches_list = []
-        visible_static_list = []
-        lengths = []
+        # patch_mask: [B, num_patches, T] - a patch is visible if ALL timesteps are visible
+        # Actually: a patch is visible if NONE of its timesteps are masked
+        visible_patch_mask = ~patch_mask.any(dim=2)  # [B, num_patches] True = visible patch
 
-        for b in range(B):
-            # Get visible patches for this sample
-            # patch_mask: [num_patches, T] - if ANY timestep in patch is masked, treat patch as visible
-            # Actually, we want patch-level mask: [num_patches]
-            # Let's aggregate: a patch is visible if ANY of its timesteps are visible
-            visible_patch_mask = ~patch_mask[b].any(dim=1)  # [num_patches] True = visible patch
+        # Count visible patches per sample
+        num_visible_per_sample = visible_patch_mask.sum(dim=1)  # [B]
+        max_len = num_visible_per_sample.max().item()
 
-            visible_patch_data = x_vec[b, visible_patch_mask]  # [num_visible_patches, patch_size, T]
-            visible_static_data = static_attr[b, visible_patch_mask]  # [num_visible_patches, patch_size, stat_dim]
+        # Check if all samples have same number of visible patches (should be true with fixed mask ratio)
+        if (num_visible_per_sample == max_len).all():
+            # FAST PATH: All samples have same length, no need for complex padding logic
+            # Select visible patches directly
+            # We need to select from [B, num_patches, patch_size, T/stat_dim]
+            # This is tricky because each sample has different visible indices
 
-            visible_patches_list.append(visible_patch_data)
-            visible_static_list.append(visible_static_data)
-            lengths.append(visible_patch_data.shape[0])
-
-        # Pad to max length in batch
-        max_len = max(lengths)
-        x_padded = torch.zeros(B, max_len, patch_size, T, device=x_vec.device, dtype=self.in_proj.weight.dtype)
-        static_padded = torch.zeros(B, max_len, patch_size, static_attr.shape[-1], device=x_vec.device, dtype=self.in_proj.weight.dtype)
-
-        for b in range(B):
-            x_padded[b, :lengths[b]] = visible_patches_list[b].to(dtype=self.in_proj.weight.dtype)
-            static_padded[b, :lengths[b]] = visible_static_list[b].to(dtype=self.in_proj.weight.dtype)
-
-        # Create padding mask for transformer (True = padding)
-        padding_mask = torch.zeros(B, max_len, device=x_vec.device, dtype=torch.bool)
-        for b in range(B):
-            if lengths[b] < max_len:
-                padding_mask[b, lengths[b]:] = True
-
-        # ===== Step 2: Aggregate catchments in each patch =====
-        # x_padded: [B, max_len, patch_size, T]
-        # We need to aggregate patch_size catchments into one token per timestep
-        # Strategy: mean pooling over catchments (accounting for padding)
-
-        # First, expand catchment_padding_mask to match visible patches
-        if catchment_padding_mask is not None:
-            # catchment_padding_mask: [B, num_patches, patch_size]
-            # We need to select only visible patches
-            catchment_padding_visible = []
+            # Approach: Stack all visible patches, then reshape
+            x_visible_list = []
+            static_visible_list = []
             for b in range(B):
-                visible_patch_mask = ~patch_mask[b].any(dim=1)  # [num_patches]
-                catch_pad_b = catchment_padding_mask[b, visible_patch_mask]  # [num_visible, patch_size]
-                # Pad to max_len
-                if lengths[b] < max_len:
-                    pad = torch.ones(max_len - lengths[b], patch_size, device=x_vec.device, dtype=torch.bool)
-                    catch_pad_b = torch.cat([catch_pad_b, pad], dim=0)
-                catchment_padding_visible.append(catch_pad_b)
-            catchment_padding_visible = torch.stack(catchment_padding_visible, dim=0)  # [B, max_len, patch_size]
+                x_visible_list.append(x_vec[b, visible_patch_mask[b]])
+                static_visible_list.append(static_attr[b, visible_patch_mask[b]])
+
+            x_padded = torch.stack(x_visible_list, dim=0)  # [B, max_len, patch_size, T]
+            static_padded = torch.stack(static_visible_list, dim=0)  # [B, max_len, patch_size, stat_dim]
+            padding_mask = torch.zeros(B, max_len, device=x_vec.device, dtype=torch.bool)
+            lengths = [max_len] * B
+
+            # Also handle catchment_padding_mask
+            if catchment_padding_mask is not None:
+                catchment_padding_visible_list = []
+                for b in range(B):
+                    catchment_padding_visible_list.append(catchment_padding_mask[b, visible_patch_mask[b]])
+                catchment_padding_visible = torch.stack(catchment_padding_visible_list, dim=0)  # [B, max_len, patch_size]
+            else:
+                catchment_padding_visible = torch.zeros(B, max_len, patch_size, device=x_vec.device, dtype=torch.bool)
+
         else:
-            catchment_padding_visible = torch.zeros(B, max_len, patch_size, device=x_vec.device, dtype=torch.bool)
+            # SLOW PATH: Different lengths, need padding
+            x_padded = torch.zeros(B, max_len, patch_size, T, device=x_vec.device, dtype=self.in_proj.weight.dtype)
+            static_padded = torch.zeros(B, max_len, patch_size, static_attr.shape[-1], device=x_vec.device, dtype=self.in_proj.weight.dtype)
+            padding_mask = torch.zeros(B, max_len, device=x_vec.device, dtype=torch.bool)
+            lengths = num_visible_per_sample.cpu().tolist()
+
+            for b in range(B):
+                length = lengths[b]
+                x_padded[b, :length] = x_vec[b, visible_patch_mask[b]].to(dtype=self.in_proj.weight.dtype)
+                static_padded[b, :length] = static_attr[b, visible_patch_mask[b]].to(dtype=self.in_proj.weight.dtype)
+                if length < max_len:
+                    padding_mask[b, length:] = True
+
+            # Handle catchment_padding_mask
+            if catchment_padding_mask is not None:
+                catchment_padding_visible = []
+                for b in range(B):
+                    catch_pad_b = catchment_padding_mask[b, visible_patch_mask[b]]  # [num_visible, patch_size]
+                    # Pad to max_len
+                    if lengths[b] < max_len:
+                        pad = torch.ones(max_len - lengths[b], patch_size, device=x_vec.device, dtype=torch.bool)
+                        catch_pad_b = torch.cat([catch_pad_b, pad], dim=0)
+                    catchment_padding_visible.append(catch_pad_b)
+                catchment_padding_visible = torch.stack(catchment_padding_visible, dim=0)  # [B, max_len, patch_size]
+            else:
+                catchment_padding_visible = torch.zeros(B, max_len, patch_size, device=x_vec.device, dtype=torch.bool)
 
         # Aggregate: [B, max_len, patch_size, T] -> [B, max_len, T]
         # Mean pooling over catchments, excluding padded catchments
