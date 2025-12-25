@@ -133,6 +133,18 @@ class VectorModalityEncoder(nn.Module):
         num_visible_per_sample = visible_patch_mask.sum(dim=1)  # [B]
         max_len = num_visible_per_sample.max().item()
 
+        # Edge case: no visible patches
+        if max_len == 0:
+            # Return dummy output
+            dummy_output = torch.zeros(B, 1, self.d_model, device=x_vec.device, dtype=self.in_proj.weight.dtype)
+            dummy_padding_mask = torch.ones(B, 1, device=x_vec.device, dtype=torch.bool)
+            mask_info = {
+                'mask': patch_mask,
+                'lengths': [0] * B,
+                'padding_mask': dummy_padding_mask,
+            }
+            return dummy_output, mask_info
+
         # Check if all samples have same number of visible patches (should be true with fixed mask ratio)
         if (num_visible_per_sample == max_len).all():
             # FAST PATH: All samples have same length, VECTORIZED selection!
