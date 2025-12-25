@@ -325,20 +325,37 @@ class MultiModalMAE(nn.Module):
         Compute reconstruction loss for vector modality
 
         Args:
-            pred_vec: [B, T] predicted values
-            target_vec: [B, T] target values
-            mask: [B, T] bool mask (True=masked)
+            pred_vec: [B, num_catchments, T] predicted values (unpatchified)
+            target_vec: [B, num_patches, patch_size, T] target values (patchified)
+            mask: [B, num_patches, T] bool mask (True=masked patch)
 
         Returns:
             Scalar loss (only on masked positions)
         """
+        # Unpatchify target: [B, num_patches, patch_size, T] -> [B, num_catchments, T]
+        B, num_patches, patch_size, T = target_vec.shape
+        num_padded = num_patches * patch_size
+
+        # Flatten patch dimension: [B, num_patches, patch_size, T] -> [B, num_padded, T]
+        target_flat = target_vec.reshape(B, num_padded, T)
+
+        # Remove padding to match actual number of catchments
+        num_actual = pred_vec.shape[1]  # Should be 604
+        target_unpatch = target_flat[:, :num_actual, :]  # [B, 604, T]
+
+        # Unpatchify mask: [B, num_patches, T] -> [B, num_catchments, T]
+        # Expand mask to cover all catchments in each patch
+        mask_expanded = mask.unsqueeze(2).expand(-1, -1, patch_size, -1)  # [B, num_patches, patch_size, T]
+        mask_flat = mask_expanded.reshape(B, num_padded, T)  # [B, num_padded, T]
+        mask_unpatch = mask_flat[:, :num_actual, :]  # [B, 604, T]
+
         # MSE loss
         loss = F.mse_loss(
-            pred_vec, target_vec, reduction='none'
-        )  # [B, T]
+            pred_vec, target_unpatch, reduction='none'
+        )  # [B, num_catchments, T]
 
         # Only compute loss on masked positions
-        masked_loss = (loss * mask.float()).sum() / (mask.sum() + 1e-8)
+        masked_loss = (loss * mask_unpatch.float()).sum() / (mask_unpatch.sum() + 1e-8)
 
         return masked_loss
 

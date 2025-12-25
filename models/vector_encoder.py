@@ -48,6 +48,7 @@ class VectorModalityEncoder(nn.Module):
         use_weighted_fm: bool = False,  # Phase 2
         use_fm_layers: list = None,    # Phase 2
         use_input: bool = False,        # Phase 2
+        patch_size: int = 8,            # Spatial patch size for catchments
     ):
         super().__init__()
 
@@ -55,8 +56,10 @@ class VectorModalityEncoder(nn.Module):
         self.d_model = d_model
         self.use_weighted_fm = use_weighted_fm
         self.use_input = use_input
+        self.patch_size = patch_size
 
-        # Input projection
+        # Input projection: project each catchment's time series independently
+        # Then aggregate patch_size catchments into one token
         self.in_proj = nn.Linear(in_feat, d_model)
 
         # Positional encoding
@@ -98,45 +101,56 @@ class VectorModalityEncoder(nn.Module):
         self,
         x_vec: Tensor,
         static_attr: Tensor,
-        time_mask: Tensor
+        patch_mask: Tensor,
+        catchment_padding_mask: Optional[Tensor] = None
     ) -> tuple[Tensor, Dict]:
         """
-        Forward pass
+        Forward pass with spatial patchify
 
         Args:
-            x_vec: [B, T] time series
-            static_attr: [B, stat_dim] static attributes
-            time_mask: [B, T] bool mask (True = masked, False = visible)
+            x_vec: [B, num_patches, patch_size, T] patch-level time series
+            static_attr: [B, num_patches, patch_size, stat_dim] patch-level static attributes
+            patch_mask: [B, num_patches, T] bool mask (True = masked PATCH, False = visible)
+            catchment_padding_mask: [B, num_patches, patch_size] bool mask (True = padded catchment)
 
         Returns:
-            encoder_output: [B, L_visible+1, d_model] - sequence of visible tokens + static token
+            encoder_output: [B, L_visible+1, d_model] - sequence of visible patch tokens + static token
             mask_info: dict with mask information for decoder
         """
         # Get dimensions
-        B, T = x_vec.shape
+        B, num_patches, patch_size, T = x_vec.shape
 
-        # Ensure static_attr has the same dtype as model weights (for mixed precision training)
+        # Ensure dtype consistency
         static_attr = static_attr.to(dtype=self.in_proj.weight.dtype)
 
-        # ===== Step 1: Remove masked timesteps (MAE strategy) =====
-        # Encoder should never see masked data
-        visible_tokens_list = []
+        # ===== Step 1: Remove masked PATCHES (MAE strategy) =====
+        # Encoder should never see masked patches
+        visible_patches_list = []
+        visible_static_list = []
         lengths = []
 
         for b in range(B):
-            # Get visible timesteps for this sample
-            visible_mask = ~time_mask[b]  # True = visible
-            visible_data = x_vec[b, visible_mask]  # [num_visible]
+            # Get visible patches for this sample
+            # patch_mask: [num_patches, T] - if ANY timestep in patch is masked, treat patch as visible
+            # Actually, we want patch-level mask: [num_patches]
+            # Let's aggregate: a patch is visible if ANY of its timesteps are visible
+            visible_patch_mask = ~patch_mask[b].any(dim=1)  # [num_patches] True = visible patch
 
-            visible_tokens_list.append(visible_data)
-            lengths.append(len(visible_data))
+            visible_patch_data = x_vec[b, visible_patch_mask]  # [num_visible_patches, patch_size, T]
+            visible_static_data = static_attr[b, visible_patch_mask]  # [num_visible_patches, patch_size, stat_dim]
+
+            visible_patches_list.append(visible_patch_data)
+            visible_static_list.append(visible_static_data)
+            lengths.append(visible_patch_data.shape[0])
 
         # Pad to max length in batch
         max_len = max(lengths)
-        x_padded = torch.zeros(B, max_len, device=x_vec.device, dtype=self.in_proj.weight.dtype)
+        x_padded = torch.zeros(B, max_len, patch_size, T, device=x_vec.device, dtype=self.in_proj.weight.dtype)
+        static_padded = torch.zeros(B, max_len, patch_size, static_attr.shape[-1], device=x_vec.device, dtype=self.in_proj.weight.dtype)
 
         for b in range(B):
-            x_padded[b, :lengths[b]] = visible_tokens_list[b].to(dtype=self.in_proj.weight.dtype)
+            x_padded[b, :lengths[b]] = visible_patches_list[b].to(dtype=self.in_proj.weight.dtype)
+            static_padded[b, :lengths[b]] = visible_static_list[b].to(dtype=self.in_proj.weight.dtype)
 
         # Create padding mask for transformer (True = padding)
         padding_mask = torch.zeros(B, max_len, device=x_vec.device, dtype=torch.bool)
@@ -144,14 +158,60 @@ class VectorModalityEncoder(nn.Module):
             if lengths[b] < max_len:
                 padding_mask[b, lengths[b]:] = True
 
-        # ===== Step 2: Project to d_model =====
-        # [B, max_len] -> [B, max_len, d_model]
-        x = self.in_proj(x_padded.unsqueeze(-1))  # Add feature dim
+        # ===== Step 2: Aggregate catchments in each patch =====
+        # x_padded: [B, max_len, patch_size, T]
+        # We need to aggregate patch_size catchments into one token per timestep
+        # Strategy: mean pooling over catchments (accounting for padding)
 
-        # ===== Step 3: Add positional encoding =====
-        x = self.pos_enc(x)  # [B, max_len, d_model] - Temporal PE
+        # First, expand catchment_padding_mask to match visible patches
+        if catchment_padding_mask is not None:
+            # catchment_padding_mask: [B, num_patches, patch_size]
+            # We need to select only visible patches
+            catchment_padding_visible = []
+            for b in range(B):
+                visible_patch_mask = ~patch_mask[b].any(dim=1)  # [num_patches]
+                catch_pad_b = catchment_padding_mask[b, visible_patch_mask]  # [num_visible, patch_size]
+                # Pad to max_len
+                if lengths[b] < max_len:
+                    pad = torch.ones(max_len - lengths[b], patch_size, device=x_vec.device, dtype=torch.bool)
+                    catch_pad_b = torch.cat([catch_pad_b, pad], dim=0)
+                catchment_padding_visible.append(catch_pad_b)
+            catchment_padding_visible = torch.stack(catchment_padding_visible, dim=0)  # [B, max_len, patch_size]
+        else:
+            catchment_padding_visible = torch.zeros(B, max_len, patch_size, device=x_vec.device, dtype=torch.bool)
 
-        # ===== Step 4: FiLM-modulated Transformer layers =====
+        # Aggregate: [B, max_len, patch_size, T] -> [B, max_len, T]
+        # Mean pooling over catchments, excluding padded catchments
+        valid_mask = (~catchment_padding_visible).unsqueeze(-1).float()  # [B, max_len, patch_size, 1]
+        x_aggregated = (x_padded * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-8)  # [B, max_len, T]
+
+        # Similarly aggregate static attributes
+        static_aggregated = (static_padded * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-8)  # [B, max_len, stat_dim]
+
+        # ===== Step 3: Project to d_model =====
+        # [B, max_len, T] -> [B, max_len, T, d_model]
+        # Ensure dtype matches model weights for mixed precision training
+        x_aggregated = x_aggregated.to(dtype=self.in_proj.weight.dtype)
+        x = self.in_proj(x_aggregated.unsqueeze(-1))  # Add feature dim: [B, max_len, T, 1] -> [B, max_len, T, d_model]
+
+        # Flatten time dimension: [B, max_len, T, d_model] -> [B, max_len*T, d_model]
+        x = x.reshape(B, max_len * T, self.d_model)
+
+        # ===== Step 4: Add positional encoding =====
+        x = self.pos_enc(x)  # [B, max_len*T, d_model] - Temporal PE
+
+        # Update padding mask for flattened sequence
+        padding_mask_flat = padding_mask.unsqueeze(-1).expand(-1, -1, T).reshape(B, max_len * T)
+
+        # ===== Step 5: FiLM-modulated Transformer layers =====
+        # Use aggregated static attributes (pooled from patches)
+        # static_aggregated: [B, max_len, stat_dim]
+        # We need a single static vector per sample for FiLM
+        # Pool over patches
+        static_pooled = (static_aggregated * (~padding_mask).unsqueeze(-1).float()).sum(dim=1) / ((~padding_mask).sum(dim=1, keepdim=True).float() + 1e-8)  # [B, stat_dim]
+        # Ensure dtype consistency for mixed precision
+        static_pooled = static_pooled.to(dtype=self.in_proj.weight.dtype)
+
         if self.use_weighted_fm:
             # Phase 2: Collect multi-layer features
             x_feats = []
@@ -162,21 +222,21 @@ class VectorModalityEncoder(nn.Module):
 
             # Process through FiLM layers
             for idx, (layer, film_mlp) in enumerate(zip(self.layers, self.film_mlps)):
-                # Generate gamma and beta
-                gb = film_mlp(static_attr)
+                # Generate gamma and beta from pooled static attributes
+                gb = film_mlp(static_pooled)
                 gamma, beta = gb.chunk(2, dim=-1)
                 gamma = gamma.unsqueeze(1)
                 beta = beta.unsqueeze(1)
 
                 # Apply FiLM layer
-                x = layer(x, gamma, beta, key_padding_mask=padding_mask)
+                x = layer(x, gamma, beta, key_padding_mask=padding_mask_flat)
 
                 # Save specified layers
                 if idx in self.use_fm_layers:
                     x_feats.append(self.norm(x.clone()))
 
             # Add static token to each feature map
-            static_token = self.attr_proj(static_attr).unsqueeze(1)  # [B, 1, d_model]
+            static_token = self.attr_proj(static_pooled).unsqueeze(1)  # [B, 1, d_model]
             x_feats_with_static = []
             for feat in x_feats:
                 feat_with_static = torch.cat([feat, static_token], dim=1)  # [B, L+1, d_model]
@@ -184,10 +244,10 @@ class VectorModalityEncoder(nn.Module):
 
             # Update padding mask
             static_padding = torch.zeros(B, 1, device=x_vec.device, dtype=torch.bool)
-            padding_mask_full = torch.cat([padding_mask, static_padding], dim=1)
+            padding_mask_full = torch.cat([padding_mask_flat, static_padding], dim=1)
 
             mask_info = {
-                'mask': time_mask,
+                'mask': patch_mask,
                 'lengths': lengths,
                 'padding_mask': padding_mask_full,
             }
@@ -197,25 +257,25 @@ class VectorModalityEncoder(nn.Module):
         else:
             # Standard: Single layer output
             for layer, film_mlp in zip(self.layers, self.film_mlps):
-                gb = film_mlp(static_attr)
+                gb = film_mlp(static_pooled)
                 gamma, beta = gb.chunk(2, dim=-1)
                 gamma = gamma.unsqueeze(1)
                 beta = beta.unsqueeze(1)
-                x = layer(x, gamma, beta, key_padding_mask=padding_mask)
+                x = layer(x, gamma, beta, key_padding_mask=padding_mask_flat)
 
-            # ===== Step 5: Normalize (NO POOLING - CrossMAE style) =====
+            # ===== Step 6: Normalize (NO POOLING - CrossMAE style) =====
             x = self.norm(x)
 
-            # ===== Step 6: Add static attributes as additional token =====
-            static_token = self.attr_proj(static_attr).unsqueeze(1)
+            # ===== Step 7: Add static attributes as additional token =====
+            static_token = self.attr_proj(static_pooled).unsqueeze(1)
             encoder_output = torch.cat([x, static_token], dim=1)
 
             # Update padding mask
             static_padding = torch.zeros(B, 1, device=x_vec.device, dtype=torch.bool)
-            padding_mask_full = torch.cat([padding_mask, static_padding], dim=1)
+            padding_mask_full = torch.cat([padding_mask_flat, static_padding], dim=1)
 
             mask_info = {
-                'mask': time_mask,
+                'mask': patch_mask,
                 'lengths': lengths,
                 'padding_mask': padding_mask_full,
             }

@@ -53,6 +53,8 @@ class VectorModalityDecoder(nn.Module):
         decoder_self_attn: bool = False,
         use_weighted_fm: bool = False,  # Phase 2
         num_encoder_layers: int = 4,    # Phase 2
+        patch_size: int = 8,            # Spatial patch size for catchments
+        num_catchments: int = 604,      # Total number of catchments
     ):
         super().__init__()
 
@@ -62,6 +64,8 @@ class VectorModalityDecoder(nn.Module):
         self.use_cross_attn = use_cross_attn
         self.use_weighted_fm = use_weighted_fm
         self.num_decoder_layers = num_decoder_layers
+        self.patch_size = patch_size
+        self.num_catchments = num_catchments
 
         # Mask token (learnable)
         self.mask_token = nn.Parameter(torch.zeros(1, decoder_dim))
@@ -116,21 +120,21 @@ class VectorModalityDecoder(nn.Module):
             )
             self.decoder_norm = nn.LayerNorm(decoder_dim)
 
-        # Prediction head
-        self.pred_head = nn.Linear(decoder_dim, 1)  # Predict single value
+        # Prediction head (predicts for each catchment in patch)
+        self.pred_head = nn.Linear(decoder_dim, patch_size)  # Predict patch_size values
 
     def forward(self, encoder_output, mask_info: Dict) -> Tensor:
         """
-        Forward pass
+        Forward pass with patch-level mask
 
         Args:
             encoder_output: Encoder features
                 - If use_weighted_fm=False: [B, L_visible, encoder_dim]
                 - If use_weighted_fm=True: list of [B, L_visible, encoder_dim]
-            mask_info: dict with 'mask' [B, T], 'padding_mask' [B, L_visible]
+            mask_info: dict with 'mask' [B, num_patches, T], 'padding_mask' [B, L_visible]
 
         Returns:
-            pred_vec: [B, T] - predicted time series
+            pred_vec: [B, num_catchments, T] - predicted time series for all catchments
         """
         if self.use_cross_attn:
             return self._forward_cross_attn(encoder_output, mask_info)
@@ -139,16 +143,20 @@ class VectorModalityDecoder(nn.Module):
 
     def _forward_cross_attn(self, encoder_output, mask_info: Dict) -> Tensor:
         """
-        CrossMAE decoder: Only create queries for masked timesteps
+        CrossMAE decoder with patch-level masking
 
         Phase 2: Support WeightedFeatureMaps
         - If use_weighted_fm=True, encoder_output is list of features
         - Use WeightedFeatureMaps to combine them
         - Each decoder layer uses different weighted combination
         """
-        mask = mask_info['mask']  # [B, T]
+        patch_mask = mask_info['mask']  # [B, num_patches, T]
         padding_mask = mask_info.get('padding_mask')  # [B, L_visible]
-        B, T = mask.shape
+        B, num_patches, T = patch_mask.shape
+
+        # Calculate actual number of catchments (accounting for padding)
+        num_padded = num_patches * self.patch_size
+        num_actual = self.num_catchments
 
         # ===== Phase 2: Process encoder features =====
         if self.use_weighted_fm:
@@ -166,21 +174,23 @@ class VectorModalityDecoder(nn.Module):
             # encoder_output: [B, L_visible, encoder_dim]
             encoder_features_per_layer = None
 
-        # ===== Step 1: Create masked queries (VECTORIZED) =====
-        # Only for masked timesteps (TRUE = masked)
+        # ===== Step 1: Create masked queries for PATCHES (VECTORIZED) =====
+        # patch_mask: [B, num_patches, T] - True = masked patch-time
+        # We create queries for each masked (patch, time) combination
 
-        # Find all masked positions using vectorized operation
-        masked_indices = mask.nonzero(as_tuple=False)  # [N, 2] where N = total masked timesteps
+        # Find all masked patch-time positions using vectorized operation
+        masked_indices = patch_mask.nonzero(as_tuple=False)  # [N, 3] where N = total masked patch-times
         # masked_indices[:, 0] = batch indices
-        # masked_indices[:, 1] = time indices
+        # masked_indices[:, 1] = patch indices
+        # masked_indices[:, 2] = time indices
 
         num_masked = masked_indices.shape[0]
 
         if num_masked == 0:
-            # Edge case: no masked timesteps
+            # Edge case: no masked patches
             device = encoder_output.device if not isinstance(encoder_output, list) else encoder_output[0].device
             dtype = encoder_output.dtype if not isinstance(encoder_output, list) else encoder_output[0].dtype
-            return torch.zeros(B, T, device=device, dtype=dtype)
+            return torch.zeros(B, num_actual, T, device=device, dtype=dtype)
 
         # Vectorized query creation
         # Start with mask tokens: [N, decoder_dim]
@@ -189,11 +199,11 @@ class VectorModalityDecoder(nn.Module):
         # Add temporal positional encoding (vectorized)
         temporal_pe = self.temporal_pos.pe.squeeze(0)  # [max_time, decoder_dim]
         # Extract temporal PE for each masked timestep
-        temporal_pe_selected = temporal_pe[masked_indices[:, 1], :]  # [N, decoder_dim]
+        temporal_pe_selected = temporal_pe[masked_indices[:, 2], :]  # [N, decoder_dim]
         queries = queries + temporal_pe_selected
 
         # Store positions for later reconstruction
-        masked_positions_list = [(b.item(), t.item()) for b, t in masked_indices]
+        masked_positions_list = [(b.item(), p.item(), t.item()) for b, p, t in masked_indices]
 
         queries = queries.unsqueeze(0)  # [1, total_masked, decoder_dim]
 
@@ -202,7 +212,7 @@ class VectorModalityDecoder(nn.Module):
 
         for b in range(B):
             # Get this batch's masked queries
-            batch_mask_indices = [i for i, (bi, t) in enumerate(masked_positions_list) if bi == b]
+            batch_mask_indices = [i for i, (bi, p, t) in enumerate(masked_positions_list) if bi == b]
 
             if len(batch_mask_indices) == 0:
                 continue
@@ -241,19 +251,28 @@ class VectorModalityDecoder(nn.Module):
 
             # ===== Step 4: Prediction =====
             x = self.decoder_norm(x)  # [1, L_masked_b, decoder_dim]
-            predictions = self.pred_head(x).squeeze(-1)  # [1, L_masked_b]
+            predictions_patch = self.pred_head(x)  # [1, L_masked_b, patch_size]
 
-            all_predictions.append((batch_mask_indices, predictions))
+            all_predictions.append((batch_mask_indices, predictions_patch))
 
-        # ===== Step 5: Reconstruct full output =====
+        # ===== Step 5: Reconstruct full output and unpatchify =====
         device = encoder_output[0].device if isinstance(encoder_output, list) else encoder_output.device
         dtype = encoder_output[0].dtype if isinstance(encoder_output, list) else encoder_output.dtype
-        pred_vec = torch.zeros(B, T, device=device, dtype=dtype)
 
-        for batch_mask_indices, predictions in all_predictions:
+        # Initialize output: [B, num_padded, T]
+        pred_vec_padded = torch.zeros(B, num_padded, T, device=device, dtype=dtype)
+
+        for batch_mask_indices, predictions_patch in all_predictions:
             for local_idx, global_idx in enumerate(batch_mask_indices):
-                b, t = masked_positions_list[global_idx]
-                pred_vec[b, t] = predictions[0, local_idx]
+                b, p, t = masked_positions_list[global_idx]
+                # predictions_patch[0, local_idx]: [patch_size]
+                # Assign to all catchments in this patch
+                start_c = p * self.patch_size
+                end_c = start_c + self.patch_size
+                pred_vec_padded[b, start_c:end_c, t] = predictions_patch[0, local_idx, :]
+
+        # Remove padding: [B, num_padded, T] -> [B, num_actual, T]
+        pred_vec = pred_vec_padded[:, :num_actual, :]
 
         return pred_vec
 

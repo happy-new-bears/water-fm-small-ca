@@ -560,30 +560,82 @@ class MultiModalHydroDataset(Dataset):
         soil_norm = self._normalize_image(soil_seq, 'soil')
         temp_norm = self._normalize_image(temp_seq, 'temp')
 
-        # Get vector sequences
-        evap_seq = self.evap_data[catchment_idx, start_day_idx:end_day_idx]
-        riverflow_seq = self.riverflow_data[catchment_idx, start_day_idx:end_day_idx]
+        # Get vector sequences for ALL catchments (for spatial patchify)
+        # Shape: [num_catchments, time_steps]
+        evap_seq_all = self.evap_data[:, start_day_idx:end_day_idx]  # [C, T]
+        riverflow_seq_all = self.riverflow_data[:, start_day_idx:end_day_idx]  # [C, T]
 
         # Normalize vectors (per-catchment)
-        evap_norm = (evap_seq - self.stats['evap_mean'][catchment_idx].item()) / (
-            self.stats['evap_std'][catchment_idx].item() + 1e-8
-        )
-        riverflow_norm = (riverflow_seq - self.stats['riverflow_mean'][catchment_idx].item()) / (
-            self.stats['riverflow_std'][catchment_idx].item() + 1e-8
-        )
+        evap_norm_list = []
+        riverflow_norm_list = []
+        for c_idx in range(self.num_catchments):
+            evap_norm_c = (evap_seq_all[c_idx] - self.stats['evap_mean'][c_idx].item()) / (
+                self.stats['evap_std'][c_idx].item() + 1e-8
+            )
+            riverflow_norm_c = (riverflow_seq_all[c_idx] - self.stats['riverflow_mean'][c_idx].item()) / (
+                self.stats['riverflow_std'][c_idx].item() + 1e-8
+            )
+            evap_norm_list.append(evap_norm_c)
+            riverflow_norm_list.append(riverflow_norm_c)
 
-        # Normalize static attributes (global)
-        static_norm = (
-            self.static_attrs[catchment_idx] - self.stats['static_mean']
-        ) / (self.stats['static_std'] + 1e-8)
+        # Stack: [num_catchments, time_steps]
+        evap_norm_all = np.stack(evap_norm_list, axis=0)
+        riverflow_norm_all = np.stack(riverflow_norm_list, axis=0)
+
+        # Patchify: [num_catchments, time_steps] -> [num_patches, patch_size, time_steps]
+        patch_size = 8
+        num_catchments = evap_norm_all.shape[0]
+        num_patches = (num_catchments + patch_size - 1) // patch_size  # Ceiling division
+
+        # Pad to make divisible by patch_size
+        if num_catchments % patch_size != 0:
+            pad_size = num_patches * patch_size - num_catchments
+            evap_pad = np.zeros((pad_size, evap_norm_all.shape[1]))
+            riverflow_pad = np.zeros((pad_size, riverflow_norm_all.shape[1]))
+            evap_norm_all = np.concatenate([evap_norm_all, evap_pad], axis=0)
+            riverflow_norm_all = np.concatenate([riverflow_norm_all, riverflow_pad], axis=0)
+
+        # Reshape to patches: [num_patches, patch_size, time_steps]
+        evap_patches = evap_norm_all.reshape(num_patches, patch_size, -1)
+        riverflow_patches = riverflow_norm_all.reshape(num_patches, patch_size, -1)
+
+        # Normalize static attributes for ALL catchments (for patchify)
+        # Shape: [num_catchments, stat_dim]
+        static_norm_all_list = []
+        for c_idx in range(self.num_catchments):
+            static_norm_c = (
+                self.static_attrs[c_idx] - self.stats['static_mean']
+            ) / (self.stats['static_std'] + 1e-8)
+            static_norm_all_list.append(static_norm_c)
+
+        static_norm_all = torch.stack(static_norm_all_list, dim=0)  # [num_catchments, stat_dim]
+
+        # Pad static attributes if needed
+        if num_catchments % patch_size != 0:
+            pad_size = num_patches * patch_size - num_catchments
+            static_pad = torch.zeros(pad_size, static_norm_all.shape[1])
+            static_norm_all = torch.cat([static_norm_all, static_pad], dim=0)
+
+        # Reshape to patches: [num_patches, patch_size, stat_dim]
+        static_patches = static_norm_all.reshape(num_patches, patch_size, -1)
+
+        # Create padding mask: [num_patches, patch_size] - True = padding catchment
+        padding_mask = torch.zeros(num_patches, patch_size, dtype=torch.bool)
+        if num_catchments % patch_size != 0:
+            # Mark padded catchments as padding
+            last_patch_valid = num_catchments % patch_size
+            padding_mask[-1, last_patch_valid:] = True
 
         return {
             'precip': precip_norm,
             'soil': soil_norm,
             'temp': temp_norm,
-            'evap': evap_norm,
-            'riverflow': riverflow_norm,
-            'static_attr': static_norm,
+            'evap': evap_patches,  # [num_patches, patch_size, time_steps]
+            'riverflow': riverflow_patches,  # [num_patches, patch_size, time_steps]
+            'static_attr': static_patches,  # [num_patches, patch_size, stat_dim]
+            'catchment_padding_mask': padding_mask,  # [num_patches, patch_size]
+            'num_patches': num_patches,
+            'patch_size': patch_size,
             'catchment_idx': catchment_idx,
             'catchment_id': self.catchment_ids[catchment_idx],
             'start_date': date_range[0],

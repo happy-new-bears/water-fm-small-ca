@@ -25,9 +25,11 @@ class MultiScaleMaskedCollate:
         # Mask parameters
         mask_ratio: float = 0.75,  # Ratio to mask (0.75 like MAE paper)
         # Image patch parameters
-        patch_size: int = 10,  # Each patch is 10x10 pixels
+        patch_size: int = 10,  # Each patch is 10x10 pixels for images
         image_height: int = 290,
         image_width: int = 180,
+        # Vector patch parameters (spatial patchify)
+        vector_patch_size: int = 8,  # Each spatial patch has 8 catchments
         # Land mask
         land_mask_path: str = None,  # Path to land mask file
         land_threshold: float = 0.5,  # Minimum land ratio for valid patch
@@ -39,6 +41,7 @@ class MultiScaleMaskedCollate:
         self.seq_len = seq_len
         self.mask_ratio = mask_ratio
         self.patch_size = patch_size
+        self.vector_patch_size = vector_patch_size
         self.image_height = image_height
         self.image_width = image_width
         self.land_threshold = land_threshold
@@ -137,28 +140,35 @@ class MultiScaleMaskedCollate:
         B = len(batch_list)
         seq_len = self.seq_len
 
-        # Step 1: Truncate data to fixed sequence length
+        # Step 1: Truncate data to fixed sequence length and extract metadata
         truncated_batch = []
+        num_vec_patches = None  # Will be set from first sample
         for sample in batch_list:
             truncated = {}
             for key, val in sample.items():
-                if key in self.all_modalities:
+                if key in self.image_modalities:
+                    # Image: truncate time dimension
                     truncated[key] = val[:seq_len]
+                elif key in self.vector_modalities:
+                    # Vector patches: truncate time dimension  [num_patches, patch_size, T]
+                    truncated[key] = val[:, :, :seq_len]
+                    if num_vec_patches is None:
+                        num_vec_patches = val.shape[0]  # Get number of patches
                 else:
                     truncated[key] = val
             truncated_batch.append(truncated)
 
         # Step 2: Generate masks
         if self.mode == 'train':
-            masks = self._generate_masks(B, seq_len)
+            masks = self._generate_masks(B, seq_len, num_vec_patches)
         else:
             # No masking for validation/test
             masks = {
                 # Image masks: [B, T, num_patches]
                 **{mod: np.zeros((B, seq_len, self.num_patches), dtype=bool)
                    for mod in self.image_modalities},
-                # Vector masks: [B, T]
-                **{mod: np.zeros((B, seq_len), dtype=bool)
+                # Vector masks: [B, num_vec_patches, T]
+                **{mod: np.zeros((B, num_vec_patches, seq_len), dtype=bool)
                    for mod in self.vector_modalities}
             }
 
@@ -172,38 +182,46 @@ class MultiScaleMaskedCollate:
             ]).float()  # [B, T, 290, 180]
             batch_dict[f'{mod}_mask'] = torch.from_numpy(masks[mod])  # [B, T, num_patches]
 
-        # Vector modalities
+        # Vector modalities (patch-level)
         for mod in self.vector_modalities:
             batch_dict[mod] = torch.stack([
                 torch.from_numpy(s[mod]) for s in truncated_batch
-            ]).float()  # [B, T]
-            batch_dict[f'{mod}_mask'] = torch.from_numpy(masks[mod])  # [B, T]
+            ]).float()  # [B, num_patches, patch_size, T]
+            batch_dict[f'{mod}_mask'] = torch.from_numpy(masks[mod])  # [B, num_patches, T]
 
-        # Static attributes
+        # Static attributes (patch-level)
         batch_dict['static_attr'] = torch.stack([
             s['static_attr'] for s in truncated_batch
-        ])  # [B, num_features]
+        ])  # [B, num_patches, patch_size, num_features]
+
+        # Catchment padding mask
+        batch_dict['catchment_padding_mask'] = torch.stack([
+            s['catchment_padding_mask'] for s in truncated_batch
+        ])  # [B, num_patches, patch_size]
 
         # Metadata
         batch_dict['catchment_ids'] = torch.tensor([
             s['catchment_id'] for s in truncated_batch
         ], dtype=torch.long)
         batch_dict['seq_len'] = seq_len
+        batch_dict['num_vec_patches'] = num_vec_patches
+        batch_dict['vector_patch_size'] = truncated_batch[0]['patch_size']
 
         return batch_dict
 
-    def _generate_masks(self, B: int, seq_len: int) -> Dict[str, np.ndarray]:
+    def _generate_masks(self, B: int, seq_len: int, num_vec_patches: int) -> Dict[str, np.ndarray]:
         """
         Generate masks for each modality
 
         Args:
             B: batch size
             seq_len: sequence length
+            num_vec_patches: number of spatial patches for vectors
 
         Returns:
             Dictionary with:
             - Image modalities: mask [B, T, num_patches]
-            - Vector modalities: mask [B, T]
+            - Vector modalities: mask [B, num_patches, T]
         """
         masks = {}
 
@@ -214,8 +232,8 @@ class MultiScaleMaskedCollate:
             for mod in self.image_modalities:
                 masks[mod] = image_mask.copy()
 
-            # For vectors: generate temporal mask [B, T]
-            vector_mask = self._generate_vector_mask(B, seq_len)
+            # For vectors: generate patch-level temporal mask [B, num_patches, T]
+            vector_mask = self._generate_vector_mask(B, seq_len, num_vec_patches)
             for mod in self.vector_modalities:
                 masks[mod] = vector_mask.copy()
 
@@ -224,7 +242,7 @@ class MultiScaleMaskedCollate:
             for mod in self.image_modalities:
                 masks[mod] = self._generate_image_mask(B, seq_len)
             for mod in self.vector_modalities:
-                masks[mod] = self._generate_vector_mask(B, seq_len)
+                masks[mod] = self._generate_vector_mask(B, seq_len, num_vec_patches)
 
         return masks
 
@@ -275,31 +293,42 @@ class MultiScaleMaskedCollate:
 
         return np.stack(masks, axis=0)  # [B, T, num_patches]
 
-    def _generate_vector_mask(self, B: int, seq_len: int) -> np.ndarray:
+    def _generate_vector_mask(self, B: int, seq_len: int, num_patches: int) -> np.ndarray:
         """
-        Generate temporal mask for vectors
+        Generate patch-level temporal mask for vectors (similar to image masking)
 
-        Randomly selects mask_ratio of timesteps to mask.
+        Randomly selects mask_ratio of (patch, time) combinations to mask.
 
         Args:
             B: batch size
             seq_len: sequence length
+            num_patches: number of spatial patches
 
         Returns:
-            mask: [B, T], True = positions to predict
+            mask: [B, num_patches, T], True = patch-time positions to predict
         """
         masks = []
 
         for _ in range(B):
-            # Random temporal mask: select mask_ratio of days to mask
-            num_to_mask = int(seq_len * self.mask_ratio)
-            time_mask = np.zeros(seq_len, dtype=bool)
-            masked_indices = np.random.choice(
-                seq_len,
-                size=num_to_mask,
-                replace=False
-            )
-            time_mask[masked_indices] = True
-            masks.append(time_mask)
+            # Generate patch-level temporal mask: [num_patches, T]
+            # Similar to image masking strategy but for spatial patches over time
 
-        return np.stack(masks, axis=0)  # [B, T]
+            # Create mask for each time step
+            sample_masks = []
+            for _ in range(seq_len):
+                # Randomly select which patches to mask at this timestep
+                num_to_mask = int(num_patches * self.mask_ratio)
+                patch_mask = np.zeros(num_patches, dtype=bool)
+                masked_patch_indices = np.random.choice(
+                    num_patches,
+                    size=num_to_mask,
+                    replace=False
+                )
+                patch_mask[masked_patch_indices] = True
+                sample_masks.append(patch_mask)
+
+            # Stack to [T, num_patches], then transpose to [num_patches, T]
+            mask_2d = np.stack(sample_masks, axis=0).T  # [num_patches, T]
+            masks.append(mask_2d)
+
+        return np.stack(masks, axis=0)  # [B, num_patches, T]
