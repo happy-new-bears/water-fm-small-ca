@@ -49,6 +49,22 @@ class MultiModalMAE(nn.Module):
                 torch.arange(num_patches, dtype=torch.long)
             )
 
+        # ========== Modality Tokens (Encoder) ==========
+        # 5个encoder modality tokens (d_model维度)
+        self.modality_precip = nn.Parameter(torch.zeros(1, 1, config.d_model))
+        self.modality_soil = nn.Parameter(torch.zeros(1, 1, config.d_model))
+        self.modality_temp = nn.Parameter(torch.zeros(1, 1, config.d_model))
+        self.modality_evap = nn.Parameter(torch.zeros(1, 1, config.d_model))
+        self.modality_riverflow = nn.Parameter(torch.zeros(1, 1, config.d_model))
+
+        # ========== Decoder Modality Tokens ==========
+        # 5个decoder modality tokens (decoder_dim维度)
+        self.decoder_modality_precip = nn.Parameter(torch.zeros(1, 1, config.decoder_dim))
+        self.decoder_modality_soil = nn.Parameter(torch.zeros(1, 1, config.decoder_dim))
+        self.decoder_modality_temp = nn.Parameter(torch.zeros(1, 1, config.decoder_dim))
+        self.decoder_modality_evap = nn.Parameter(torch.zeros(1, 1, config.decoder_dim))
+        self.decoder_modality_riverflow = nn.Parameter(torch.zeros(1, 1, config.decoder_dim))
+
         # ========== Image Encoders ==========
         self.precip_encoder = ImageModalityEncoder(
             patch_size=config.patch_size,
@@ -62,6 +78,7 @@ class MultiModalMAE(nn.Module):
             use_weighted_fm=config.use_weighted_fm,  # NEW: Phase 2
             use_fm_layers=config.use_fm_layers,      # NEW: Phase 2
             use_input=config.use_input,              # NEW: Phase 2
+            modality_token=self.modality_precip,     # NEW: Cross-modal fusion
         )
 
         self.soil_encoder = ImageModalityEncoder(
@@ -76,6 +93,7 @@ class MultiModalMAE(nn.Module):
             use_weighted_fm=config.use_weighted_fm,  # NEW: Phase 2
             use_fm_layers=config.use_fm_layers,      # NEW: Phase 2
             use_input=config.use_input,              # NEW: Phase 2
+            modality_token=self.modality_soil,       # NEW: Cross-modal fusion
         )
 
         self.temp_encoder = ImageModalityEncoder(
@@ -90,6 +108,7 @@ class MultiModalMAE(nn.Module):
             use_weighted_fm=config.use_weighted_fm,  # NEW: Phase 2
             use_fm_layers=config.use_fm_layers,      # NEW: Phase 2
             use_input=config.use_input,              # NEW: Phase 2
+            modality_token=self.modality_temp,       # NEW: Cross-modal fusion
         )
 
         # ========== Vector Encoders (with FiLM) ==========
@@ -109,6 +128,7 @@ class MultiModalMAE(nn.Module):
             use_fm_layers=config.use_fm_layers,      # Phase 2
             use_input=config.use_input,              # Phase 2
             patch_size=config.vector_patch_size,     # NEW: Vector patch size
+            modality_token=self.modality_evap,       # NEW: Cross-modal fusion
         )
 
         self.riverflow_encoder = VectorModalityEncoder(
@@ -123,7 +143,27 @@ class MultiModalMAE(nn.Module):
             use_fm_layers=config.use_fm_layers,      # Phase 2
             use_input=config.use_input,              # Phase 2
             patch_size=config.vector_patch_size,     # NEW: Vector patch size
+            modality_token=self.modality_riverflow,  # NEW: Cross-modal fusion
         )
+
+        # ========== Shared Fusion Transformer ==========
+        # 参考CAV-MAE的blocks_u (unified branch)
+        # 让多个模态的visible tokens互相交互
+        self.shared_depth = getattr(config, 'shared_depth', 1)  # 默认1层
+
+        self.blocks_shared = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=config.d_model,
+                nhead=config.nhead,
+                dim_feedforward=4 * config.d_model,
+                dropout=config.dropout,
+                batch_first=True,
+            )
+            for _ in range(self.shared_depth)
+        ])
+
+        # Normalization for fused features
+        self.norm_shared = nn.LayerNorm(config.d_model)
 
         # ========== Image Decoders ==========
         num_patches = (config.image_height // config.patch_size) * \
@@ -201,6 +241,21 @@ class MultiModalMAE(nn.Module):
             num_encoder_layers=config.vec_encoder_layers,  # Phase 2
         )
 
+        # ========== Initialize modality tokens ==========
+        # Encoder modality tokens
+        nn.init.normal_(self.modality_precip, std=0.02)
+        nn.init.normal_(self.modality_soil, std=0.02)
+        nn.init.normal_(self.modality_temp, std=0.02)
+        nn.init.normal_(self.modality_evap, std=0.02)
+        nn.init.normal_(self.modality_riverflow, std=0.02)
+
+        # Decoder modality tokens
+        nn.init.normal_(self.decoder_modality_precip, std=0.02)
+        nn.init.normal_(self.decoder_modality_soil, std=0.02)
+        nn.init.normal_(self.decoder_modality_temp, std=0.02)
+        nn.init.normal_(self.decoder_modality_evap, std=0.02)
+        nn.init.normal_(self.decoder_modality_riverflow, std=0.02)
+
     def forward(self, batch: Dict) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
         Forward pass
@@ -237,15 +292,84 @@ class MultiModalMAE(nn.Module):
             batch['riverflow'], batch['static_attr'], batch['riverflow_mask']
         )
 
+        # ===== Shared Fusion Layers =====
+        # Step 1: 获取batch size和device
+        B = precip_token.shape[0]
+        device = precip_token.device
+
+        # Step 2: 拼接所有模态的visible tokens
+        # 注意: Vector modality的最后一个token是static token，需要排除
+        all_tokens = torch.cat([
+            precip_token,              # [B, L_precip, d_model]
+            soil_token,                # [B, L_soil, d_model]
+            temp_token,                # [B, L_temp, d_model]
+            evap_token[:, :-1, :],     # [B, L_evap-1, d_model] 排除static token
+            riverflow_token[:, :-1, :] # [B, L_river-1, d_model] 排除static token
+        ], dim=1)  # [B, L_total, d_model]
+
+        # Step 3: 创建padding mask (拼接各自的padding mask)
+        # 从mask_info中获取padding_mask，如果没有则创建全False的mask
+        precip_pad = precip_mask_info.get('padding_mask',
+            torch.zeros(B, precip_token.shape[1], device=device, dtype=torch.bool))
+        soil_pad = soil_mask_info.get('padding_mask',
+            torch.zeros(B, soil_token.shape[1], device=device, dtype=torch.bool))
+        temp_pad = temp_mask_info.get('padding_mask',
+            torch.zeros(B, temp_token.shape[1], device=device, dtype=torch.bool))
+        evap_pad = evap_mask_info.get('padding_mask',
+            torch.zeros(B, evap_token.shape[1], device=device, dtype=torch.bool))
+        riverflow_pad = riverflow_mask_info.get('padding_mask',
+            torch.zeros(B, riverflow_token.shape[1], device=device, dtype=torch.bool))
+
+        # 排除vector modality的static token的padding (最后一个是static token)
+        evap_pad_seq = evap_pad[:, :-1] if evap_pad.shape[1] > 0 else evap_pad
+        riverflow_pad_seq = riverflow_pad[:, :-1] if riverflow_pad.shape[1] > 0 else riverflow_pad
+
+        all_padding_mask = torch.cat([
+            precip_pad,
+            soil_pad,
+            temp_pad,
+            evap_pad_seq,
+            riverflow_pad_seq
+        ], dim=1)  # [B, L_total]
+
+        # Step 4: 通过shared transformer进行跨模态融合
+        fused_features = all_tokens
+        for blk in self.blocks_shared:
+            fused_features = blk(fused_features, src_key_padding_mask=all_padding_mask)
+        fused_features = self.norm_shared(fused_features)
+        # fused_features: [B, L_total, d_model] - 融合后的multi-modal features
+
         # ===== Decode all modalities =====
+        # ⭐ 所有decoder现在接收fused_features（而非单模态token）
+
         # Image modalities
-        precip_pred = self.precip_decoder(precip_token, precip_mask_info)
-        soil_pred = self.soil_decoder(soil_token, soil_mask_info)
-        temp_pred = self.temp_decoder(temp_token, temp_mask_info)
+        precip_pred = self.precip_decoder(
+            fused_features,                          # ⭐ 改为fused_features
+            precip_mask_info,
+            decoder_modality_token=self.decoder_modality_precip  # ⭐ 新增
+        )
+        soil_pred = self.soil_decoder(
+            fused_features,                          # ⭐ 改为fused_features
+            soil_mask_info,
+            decoder_modality_token=self.decoder_modality_soil  # ⭐ 新增
+        )
+        temp_pred = self.temp_decoder(
+            fused_features,                          # ⭐ 改为fused_features
+            temp_mask_info,
+            decoder_modality_token=self.decoder_modality_temp  # ⭐ 新增
+        )
 
         # Vector modalities
-        evap_pred = self.evap_decoder(evap_token, evap_mask_info)
-        riverflow_pred = self.riverflow_decoder(riverflow_token, riverflow_mask_info)
+        evap_pred = self.evap_decoder(
+            fused_features,                          # ⭐ 改为fused_features
+            evap_mask_info,
+            decoder_modality_token=self.decoder_modality_evap  # ⭐ 新增
+        )
+        riverflow_pred = self.riverflow_decoder(
+            fused_features,                          # ⭐ 改为fused_features
+            riverflow_mask_info,
+            decoder_modality_token=self.decoder_modality_riverflow  # ⭐ 新增
+        )
 
         # ===== Compute losses =====
         loss_dict = {}
@@ -269,8 +393,14 @@ class MultiModalMAE(nn.Module):
             riverflow_pred, batch['riverflow'], batch['riverflow_mask']
         )
 
-        # Total loss (simple sum)
-        total_loss = sum(loss_dict.values())
+        # Total loss with task weights
+        total_loss = 0.0
+        task_weights = getattr(self.config, 'task_weights', {})
+
+        for key, value in loss_dict.items():
+            weight = task_weights.get(key, 1.0)  # Default weight is 1.0
+            total_loss += weight * value
+
         loss_dict['total_loss'] = total_loss
 
         return total_loss, loss_dict
@@ -317,7 +447,8 @@ class MultiModalMAE(nn.Module):
         combined_mask = mask.float() * valid_mask  # [B, T, num_patches]
 
         # Only compute loss on masked AND valid patches
-        masked_loss = (loss * combined_mask).sum() / (combined_mask.sum() + 1e-8)
+        # Use 1e-6 instead of 1e-8 for FP16 compatibility (1e-8 rounds to 0 in FP16)
+        masked_loss = (loss * combined_mask).sum() / (combined_mask.sum() + 1e-6)
 
         return masked_loss
 
@@ -361,7 +492,8 @@ class MultiModalMAE(nn.Module):
         )  # [B, num_catchments, T]
 
         # Only compute loss on masked positions
-        masked_loss = (loss * mask_unpatch.float()).sum() / (mask_unpatch.sum() + 1e-8)
+        # Use 1e-6 instead of 1e-8 for FP16 compatibility
+        masked_loss = (loss * mask_unpatch.float()).sum() / (mask_unpatch.sum() + 1e-6)
 
         return masked_loss
 

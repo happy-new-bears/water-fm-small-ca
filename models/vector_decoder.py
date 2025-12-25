@@ -67,11 +67,20 @@ class VectorModalityDecoder(nn.Module):
         self.patch_size = patch_size
         self.num_catchments = num_catchments
 
+        # Calculate number of patches (604 catchments / 8 = 76 patches)
+        self.num_patches = 76  # This should match the encoder
+
         # Mask token (learnable)
         self.mask_token = nn.Parameter(torch.zeros(1, decoder_dim))
         nn.init.normal_(self.mask_token, std=0.02)
 
-        # Temporal positional encoding
+        # Spatial positional embedding (learnable, for all patches)
+        self.spatial_pos = nn.Parameter(
+            torch.zeros(1, self.num_patches, decoder_dim)
+        )
+        nn.init.normal_(self.spatial_pos, std=0.02)
+
+        # Temporal positional encoding (fixed sincos)
         self.temporal_pos = PositionalEncoding(decoder_dim, max_time_steps)
 
         # Decoder blocks
@@ -123,7 +132,7 @@ class VectorModalityDecoder(nn.Module):
         # Prediction head (predicts for each catchment in patch)
         self.pred_head = nn.Linear(decoder_dim, patch_size)  # Predict patch_size values
 
-    def forward(self, encoder_output, mask_info: Dict) -> Tensor:
+    def forward(self, encoder_output, mask_info: Dict, decoder_modality_token=None) -> Tensor:
         """
         Forward pass with patch-level mask
 
@@ -132,16 +141,17 @@ class VectorModalityDecoder(nn.Module):
                 - If use_weighted_fm=False: [B, L_visible, encoder_dim]
                 - If use_weighted_fm=True: list of [B, L_visible, encoder_dim]
             mask_info: dict with 'mask' [B, num_patches, T], 'padding_mask' [B, L_visible]
+            decoder_modality_token: [1, 1, decoder_dim] decoder modality token (optional)
 
         Returns:
             pred_vec: [B, num_catchments, T] - predicted time series for all catchments
         """
         if self.use_cross_attn:
-            return self._forward_cross_attn(encoder_output, mask_info)
+            return self._forward_cross_attn(encoder_output, mask_info, decoder_modality_token)
         else:
-            return self._forward_self_attn(encoder_output, mask_info)
+            return self._forward_self_attn(encoder_output, mask_info, decoder_modality_token)
 
-    def _forward_cross_attn(self, encoder_output, mask_info: Dict) -> Tensor:
+    def _forward_cross_attn(self, encoder_output, mask_info: Dict, decoder_modality_token=None) -> Tensor:
         """
         Vectorized CrossMAE decoder for vectors (NO LOOPS over batch!)
 
@@ -176,16 +186,27 @@ class VectorModalityDecoder(nn.Module):
         # nonzero() returns indices in order (b, p, t), which we rely on
         indices = patch_mask.nonzero(as_tuple=False)  # [Total_Masked, 3]
 
-        # Extract t indices for Temporal PE
-        t_indices = indices[:, 2].view(B, num_masked_per_sample)  # [B, k]
+        # Extract p and t indices for Position Embedding
+        p_indices = indices[:, 1].view(B, num_masked_per_sample)  # [B, k] patch indices
+        t_indices = indices[:, 2].view(B, num_masked_per_sample)  # [B, k] time indices
 
         # Create Queries [B, k, decoder_dim]
         queries = self.mask_token.expand(B, num_masked_per_sample, -1).clone()
+
+        # Add Spatial PE (Gathering, NO LOOP!)
+        # self.spatial_pos: [1, num_patches, decoder_dim]
+        # p_indices: [B, k] -> Gather -> [B, k, decoder_dim]
+        spatial_emb = self.spatial_pos[0, p_indices]  # [B, k, decoder_dim]
+        queries = queries + spatial_emb
 
         # Add Temporal PE (Gathering, NO LOOP!)
         # temporal_pos.pe: [1, max_len, decoder_dim] -> [max_len, decoder_dim]
         temporal_emb = self.temporal_pos.pe.squeeze(0)[t_indices]  # [B, k, decoder_dim]
         queries = queries + temporal_emb
+
+        # Add Decoder Modality Token (CAV-MAE style: after pos_embed)
+        if decoder_modality_token is not None:
+            queries = queries + decoder_modality_token  # [1, 1, decoder_dim] broadcast to [B, k, decoder_dim]
 
         # ===== Step 2: Batched Cross Attention (PARALLEL!) =====
         x = queries  # [B, k, decoder_dim]
@@ -233,7 +254,7 @@ class VectorModalityDecoder(nn.Module):
 
         return pred_vec
 
-    def _forward_self_attn(self, encoder_output: Tensor, mask_info: Dict) -> Tensor:
+    def _forward_self_attn(self, encoder_output: Tensor, mask_info: Dict, decoder_modality_token=None) -> Tensor:
         """
         Fallback: Standard self-attention decoder (for compatibility)
         """
@@ -259,6 +280,10 @@ class VectorModalityDecoder(nn.Module):
 
         # Add temporal PE
         x = self.temporal_pos(x)  # [B, T, decoder_dim]
+
+        # Add Decoder Modality Token (if provided)
+        if decoder_modality_token is not None:
+            x = x + decoder_modality_token  # [1, 1, decoder_dim] broadcast
 
         # Self-attention transformer
         x = self.transformer(x)

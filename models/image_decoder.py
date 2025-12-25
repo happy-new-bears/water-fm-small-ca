@@ -134,7 +134,7 @@ class ImageModalityDecoder(nn.Module):
         # Prediction head
         self.pred_head = nn.Linear(decoder_dim, patch_dim)
 
-    def forward(self, encoder_output, mask_info: Dict) -> Tensor:
+    def forward(self, encoder_output, mask_info: Dict, decoder_modality_token=None) -> Tensor:
         """
         Forward pass
 
@@ -143,16 +143,17 @@ class ImageModalityDecoder(nn.Module):
                 - If use_weighted_fm=False: [B, L_visible, encoder_dim]
                 - If use_weighted_fm=True: list of [B, L_visible, encoder_dim]
             mask_info: dict with 'mask' [B, T, num_patches], 'padding_mask' [B, L_visible]
+            decoder_modality_token: [1, 1, decoder_dim] decoder modality token (optional)
 
         Returns:
             pred_patches: [B, T, num_patches, patch_dim] - predicted patches
         """
         if self.use_cross_attn:
-            return self._forward_cross_attn(encoder_output, mask_info)
+            return self._forward_cross_attn(encoder_output, mask_info, decoder_modality_token)
         else:
-            return self._forward_self_attn(encoder_output, mask_info)
+            return self._forward_self_attn(encoder_output, mask_info, decoder_modality_token)
 
-    def _forward_cross_attn(self, encoder_output, mask_info: Dict) -> Tensor:
+    def _forward_cross_attn(self, encoder_output, mask_info: Dict, decoder_modality_token=None) -> Tensor:
         """
         Vectorized CrossMAE decoder (NO LOOPS over batch!)
 
@@ -201,6 +202,10 @@ class ImageModalityDecoder(nn.Module):
         temporal_emb = self.temporal_pos.pe.squeeze(0)[t_indices]  # [B, k, decoder_dim]
         queries = queries + temporal_emb
 
+        # Add Decoder Modality Token (CAV-MAE style: after pos_embed)
+        if decoder_modality_token is not None:
+            queries = queries + decoder_modality_token  # [1, 1, decoder_dim] broadcast to [B, k, decoder_dim]
+
         # ===== Step 2: Batched Cross Attention (PARALLEL!) =====
         x = queries  # [B, k, decoder_dim]
 
@@ -239,7 +244,7 @@ class ImageModalityDecoder(nn.Module):
 
         return pred_patches
 
-    def _forward_self_attn(self, encoder_output: Tensor, mask_info: Dict) -> Tensor:
+    def _forward_self_attn(self, encoder_output: Tensor, mask_info: Dict, decoder_modality_token=None) -> Tensor:
         """
         Fallback: Standard self-attention decoder (for compatibility)
         """
@@ -271,6 +276,10 @@ class ImageModalityDecoder(nn.Module):
         x = x.permute(0, 2, 1, 3).reshape(B_orig * P, T_orig, D)
         x = self.temporal_pos(x)
         x = x.reshape(B_orig, P, T_orig, D).permute(0, 2, 1, 3).contiguous()
+
+        # Add Decoder Modality Token (if provided)
+        if decoder_modality_token is not None:
+            x = x + decoder_modality_token  # [1, 1, decoder_dim] broadcast
 
         # Flatten for transformer
         x = x.reshape(B, T * num_patches, self.decoder_dim)

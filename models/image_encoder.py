@@ -47,6 +47,7 @@ class ImageModalityEncoder(nn.Module):
         use_weighted_fm: bool = False,  # NEW: Phase 2
         use_fm_layers: list = None,    # NEW: Which layers to save
         use_input: bool = False,        # NEW: Include input as layer 0
+        modality_token: nn.Parameter = None,  # NEW: Modality token for cross-modal fusion
     ):
         super().__init__()
 
@@ -55,6 +56,7 @@ class ImageModalityEncoder(nn.Module):
         self.d_model = d_model
         self.use_weighted_fm = use_weighted_fm
         self.use_input = use_input
+        self.modality_token = modality_token  # Store modality token reference
 
         H, W = image_hw
         self.num_patches_h = H // patch_size  # 29
@@ -211,6 +213,10 @@ class ImageModalityEncoder(nn.Module):
 
         # Add both PEs to x (vectorized!)
         x = x + spatial_emb + temporal_emb
+
+        # Add modality token (CAV-MAE style: after pos_embed)
+        if self.modality_token is not None:
+            x = x + self.modality_token  # [1, 1, d_model] broadcast to [B, max_len, d_model]
 
         # ===== Step 6: Transformer encoder =====
         if self.use_weighted_fm:

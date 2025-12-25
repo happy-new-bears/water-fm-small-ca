@@ -49,6 +49,7 @@ class VectorModalityEncoder(nn.Module):
         use_fm_layers: list = None,    # Phase 2
         use_input: bool = False,        # Phase 2
         patch_size: int = 8,            # Spatial patch size for catchments
+        modality_token: nn.Parameter = None,  # NEW: Modality token for cross-modal fusion
     ):
         super().__init__()
 
@@ -57,13 +58,23 @@ class VectorModalityEncoder(nn.Module):
         self.use_weighted_fm = use_weighted_fm
         self.use_input = use_input
         self.patch_size = patch_size
+        self.modality_token = modality_token  # Store modality token reference
+
+        # Calculate number of patches (604 catchments / 8 = 76 patches)
+        self.num_patches = 76  # This should match the data preprocessing
 
         # Input projection: project each catchment's time series independently
         # Then aggregate patch_size catchments into one token
         self.in_proj = nn.Linear(in_feat, d_model)
 
-        # Positional encoding
-        self.pos_enc = PositionalEncoding(d_model, max_len)
+        # Spatial positional embedding (learnable, for all patches)
+        self.spatial_pos = nn.Parameter(
+            torch.zeros(1, self.num_patches, d_model)
+        )
+        nn.init.normal_(self.spatial_pos, std=0.02)
+
+        # Temporal positional encoding (fixed sincos)
+        self.temporal_pos = PositionalEncoding(d_model, max_len)
 
         # FiLM MLP layers (generate gamma and beta from static attributes)
         self.film_mlps = nn.ModuleList([
@@ -199,11 +210,12 @@ class VectorModalityEncoder(nn.Module):
 
         # Aggregate: [B, max_len, patch_size, T] -> [B, max_len, T]
         # Mean pooling over catchments, excluding padded catchments
+        # Use 1e-6 instead of 1e-8 for FP16 compatibility (1e-8 rounds to 0 in FP16)
         valid_mask = (~catchment_padding_visible).unsqueeze(-1).float()  # [B, max_len, patch_size, 1]
-        x_aggregated = (x_padded * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-8)  # [B, max_len, T]
+        x_aggregated = (x_padded * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-6)  # [B, max_len, T]
 
         # Similarly aggregate static attributes
-        static_aggregated = (static_padded * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-8)  # [B, max_len, stat_dim]
+        static_aggregated = (static_padded * valid_mask).sum(dim=2) / (valid_mask.sum(dim=2) + 1e-6)  # [B, max_len, stat_dim]
 
         # ===== Step 3: Project to d_model =====
         # [B, max_len, T] -> [B, max_len, T, d_model]
@@ -211,21 +223,50 @@ class VectorModalityEncoder(nn.Module):
         x_aggregated = x_aggregated.to(dtype=self.in_proj.weight.dtype)
         x = self.in_proj(x_aggregated.unsqueeze(-1))  # Add feature dim: [B, max_len, T, 1] -> [B, max_len, T, d_model]
 
-        # Flatten time dimension: [B, max_len, T, d_model] -> [B, max_len*T, d_model]
+        # ===== Step 4: Add positional embeddings (spatial + temporal) BEFORE flattening =====
+        # Get visible patch indices
+        # visible_patch_mask: [B, num_patches] - True for visible patches
+        # We need to gather the patch indices for each sample
+        patch_indices_per_sample = []
+        for b in range(B):
+            visible_idx = torch.nonzero(visible_patch_mask[b], as_tuple=True)[0]  # [max_len]
+            patch_indices_per_sample.append(visible_idx)
+
+        # Stack into [B, max_len]
+        patch_indices = torch.stack(patch_indices_per_sample, dim=0)  # [B, max_len]
+
+        # Gather spatial PE: self.spatial_pos is [1, num_patches, d_model]
+        # spatial_emb: [B, max_len, d_model]
+        spatial_emb = self.spatial_pos[0, patch_indices.view(-1)].view(B, max_len, self.d_model)
+
+        # Add spatial PE (broadcast to time dimension)
+        x = x + spatial_emb.unsqueeze(2)  # [B, max_len, T, d_model]
+
+        # Gather temporal PE for each time step
+        # temporal_pos.pe: [1, max_len, d_model] where max_len is max_time_steps
+        temporal_pe = self.temporal_pos.pe.squeeze(0)  # [max_time_steps, d_model]
+        temporal_emb = temporal_pe[:T, :]  # [T, d_model]
+
+        # Add temporal PE (broadcast to batch and patch dimensions)
+        x = x + temporal_emb.unsqueeze(0).unsqueeze(0)  # [B, max_len, T, d_model]
+
+        # ===== Step 5: Flatten time dimension =====
+        # [B, max_len, T, d_model] -> [B, max_len*T, d_model]
         x = x.reshape(B, max_len * T, self.d_model)
 
-        # ===== Step 4: Add positional encoding =====
-        x = self.pos_enc(x)  # [B, max_len*T, d_model] - Temporal PE
+        # Add modality token (CAV-MAE style: after pos_embed, before transformer)
+        if self.modality_token is not None:
+            x = x + self.modality_token  # [1, 1, d_model] broadcast to [B, max_len*T, d_model]
 
         # Update padding mask for flattened sequence
         padding_mask_flat = padding_mask.unsqueeze(-1).expand(-1, -1, T).reshape(B, max_len * T)
 
-        # ===== Step 5: FiLM-modulated Transformer layers =====
+        # ===== Step 6: FiLM-modulated Transformer layers =====
         # Use aggregated static attributes (pooled from patches)
         # static_aggregated: [B, max_len, stat_dim]
         # We need a single static vector per sample for FiLM
-        # Pool over patches
-        static_pooled = (static_aggregated * (~padding_mask).unsqueeze(-1).float()).sum(dim=1) / ((~padding_mask).sum(dim=1, keepdim=True).float() + 1e-8)  # [B, stat_dim]
+        # Pool over patches (use 1e-6 for FP16 compatibility)
+        static_pooled = (static_aggregated * (~padding_mask).unsqueeze(-1).float()).sum(dim=1) / ((~padding_mask).sum(dim=1, keepdim=True).float() + 1e-6)  # [B, stat_dim]
         # Ensure dtype consistency for mixed precision
         static_pooled = static_pooled.to(dtype=self.in_proj.weight.dtype)
 
@@ -280,10 +321,10 @@ class VectorModalityEncoder(nn.Module):
                 beta = beta.unsqueeze(1)
                 x = layer(x, gamma, beta, key_padding_mask=padding_mask_flat)
 
-            # ===== Step 6: Normalize (NO POOLING - CrossMAE style) =====
+            # ===== Step 7: Normalize (NO POOLING - CrossMAE style) =====
             x = self.norm(x)
 
-            # ===== Step 7: Add static attributes as additional token =====
+            # ===== Step 8: Add static attributes as additional token =====
             static_token = self.attr_proj(static_pooled).unsqueeze(1)
             encoder_output = torch.cat([x, static_token], dim=1)
 
