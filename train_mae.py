@@ -317,11 +317,14 @@ def create_dataloaders(train_dataset, val_dataset, config, rank, world_size):
         mode='train',
     )
 
-    # Val collate function (no masking)
+    # Val collate function (same masking as train for fair comparison)
     val_collate = MultiScaleMaskedCollate(
         seq_len=config.max_time_steps,
+        mask_ratio=config.image_mask_ratio,  # Use same mask ratio as train
+        patch_size=config.patch_size,
         land_mask_path=config.land_mask_path,
         land_threshold=config.land_threshold,
+        mask_mode='unified',
         mode='val',
     )
 
