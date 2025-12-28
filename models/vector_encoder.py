@@ -201,7 +201,7 @@ class VectorModalityEncoder(nn.Module):
         # [B, max_len] -> [B, max_len, d_model]
         x = self.in_proj(x.unsqueeze(-1))  # [B, max_len, 1] -> [B, max_len, d_model]
 
-        # ===== Step 4: VECTORIZED position embeddings (完全对齐 Image Encoder!) =====
+        # ===== Step 4: VECTORIZED position embeddings (handle variable-length sequences) =====
         # Create grids of indices [B, num_patches, T]
         # Patch indices: [[0,0...], [1,1...], ...] for each time step
         p_indices = torch.arange(num_patches, device=x_vec.device).view(1, num_patches, 1).expand(B, num_patches, T)
@@ -209,9 +209,27 @@ class VectorModalityEncoder(nn.Module):
         # Temporal indices: [[0, 1, 2...], [0, 1, 2...]] repeated for each patch
         t_indices = torch.arange(T, device=x_vec.device).view(1, 1, T).expand(B, num_patches, T)
 
-        # Select indices for visible tokens
-        p_visible = p_indices[visible_mask].view(B, -1)  # [B, max_len]
-        t_visible = t_indices[visible_mask].view(B, -1)  # [B, max_len]
+        # Select indices for visible tokens (flattened 1D tensors)
+        p_indices_flat = p_indices[visible_mask]  # [Total_Visible]
+        t_indices_flat = t_indices[visible_mask]  # [Total_Visible]
+
+        # Check if all samples have same length
+        if (num_visible_per_sample == max_len).all():
+            # FAST PATH: Reshape directly
+            p_visible = p_indices_flat.view(B, max_len)  # [B, max_len]
+            t_visible = t_indices_flat.view(B, max_len)  # [B, max_len]
+        else:
+            # SLOW PATH: Fill with padding (use first index as dummy for padded positions)
+            p_visible = torch.zeros(B, max_len, device=x_vec.device, dtype=torch.long)
+            t_visible = torch.zeros(B, max_len, device=x_vec.device, dtype=torch.long)
+
+            offset = 0
+            for b in range(B):
+                length = lengths[b]
+                p_visible[b, :length] = p_indices_flat[offset:offset+length]
+                t_visible[b, :length] = t_indices_flat[offset:offset+length]
+                # Padded positions will have index 0 (dummy values, will be masked anyway)
+                offset += length
 
         # Gather spatial PE: self.spatial_pos is [1, num_patches, d_model]
         spatial_emb = self.spatial_pos[0, p_visible.view(-1)].view(B, max_len, -1)  # [B, max_len, d_model]
