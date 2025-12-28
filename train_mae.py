@@ -196,10 +196,20 @@ def create_datasets(config, rank):
     riverflow_data = np.full((riverflow_data_partial.shape[0], len(time_vec)), 0.0, dtype=np.float32)
     riverflow_data[:, num_missing_days:] = riverflow_data_partial
 
+    # Safety check: Verify data alignment (确保time_vec在num_missing_days位置对应riverflow开始日期)
+    if num_missing_days > 0:
+        expected_riverflow_start = pd.to_datetime(config.riverflow_available_from)
+        actual_alignment_date = pd.to_datetime(time_vec[num_missing_days])
+        assert actual_alignment_date == expected_riverflow_start, \
+            f"Data alignment error: time_vec[{num_missing_days}] = {actual_alignment_date}, " \
+            f"expected {expected_riverflow_start} (riverflow_available_from)"
+
     if rank == 0:
         print(f"✓ Riverflow data padded: {riverflow_data.shape}")
         print(f"  - Missing period (1970-1988): {num_missing_days} days filled with 0.0")
         print(f"  - Valid period (1989-2015): {len(time_vec_river)} days with real data")
+        if num_missing_days > 0:
+            print(f"  - Data alignment verified: time_vec[{num_missing_days}] = {time_vec[num_missing_days]}")
 
     if rank == 0:
         print(f"✓ Vector data loaded: {evap_data.shape}")
