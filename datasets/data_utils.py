@@ -15,12 +15,13 @@ def interpolate_features(
     end: datetime,
     nan_ratio: float,
     log_level: int = logging.INFO,
+    fixed_catchment_ids: list = None,  # NEW: optionally specify catchment IDs to use
 ) -> pl.DataFrame:
     """
     Interpolate data in specified time range and nan ratio.
 
     Steps:
-    1. Filter catchments with a NaN ratio upper bound
+    1. Filter catchments with a NaN ratio upper bound (or use fixed list)
     2. Interpolate missing values for selected catchments during time period
 
     Args:
@@ -29,6 +30,7 @@ def interpolate_features(
         end: End time of the time period (exclusive)
         nan_ratio: Maximum nan ratio allowed for selecting catchment
         log_level: Logging level
+        fixed_catchment_ids: If provided, use these catchment IDs instead of filtering
 
     Returns:
         Preprocessed DataFrame
@@ -36,16 +38,23 @@ def interpolate_features(
     logger = logging.getLogger(__name__)
     logger.setLevel(log_level)
 
-    # Filter catchments with NaN ratio below threshold
+    # Filter catchments with NaN ratio below threshold or use fixed list
     time_expr = pl.col("date").ge(start) & pl.col("date").lt(end)
-    valid_cid = set(
-        cid[0]
-        for cid, g in df.filter(time_expr).group_by("ID")
-        if (g.null_count() < g.shape[0] * nan_ratio).to_numpy().all()
-    )
+
+    if fixed_catchment_ids is not None:
+        # Use provided catchment IDs
+        valid_cid = set(fixed_catchment_ids)
+        print(f"Using {len(valid_cid)} fixed catchment IDs")
+    else:
+        # Filter based on NaN ratio
+        valid_cid = set(
+            cid[0]
+            for cid, g in df.filter(time_expr).group_by("ID")
+            if (g.null_count() < g.shape[0] * nan_ratio).to_numpy().all()
+        )
+        print(f"Found {len(valid_cid)} valid catchments after filtering NaN ratio")
 
     valid_df = df.filter(pl.col("ID").is_in(valid_cid))
-    print(f"Found {valid_df['ID'].unique().len()} valid catchments after filtering NaN ratio")
 
     # Interpolate missing values
     interpolate_df = (
@@ -68,6 +77,7 @@ def load_vector_data_from_parquet(
     start: datetime,
     end: datetime,
     nan_ratio: float = 0.05,
+    fixed_catchment_ids: list = None,  # NEW: optionally specify catchment IDs
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
     """
     Load vector data from parquet file and reshape to array format.
@@ -119,7 +129,7 @@ def load_vector_data_from_parquet(
 
     # Interpolate missing values
     df_processed = interpolate_features(
-        df_filtered_by_date, start, end, nan_ratio
+        df_filtered_by_date, start, end, nan_ratio, fixed_catchment_ids=fixed_catchment_ids
     ).sort(["date", "ID"])
 
     # Get variable names in order (excluding date and ID)

@@ -166,36 +166,31 @@ def create_datasets(config, rank):
         print("Loading vector data...")
         print("=" * 60)
 
-    # Load both evaporation and riverflow together to ensure same catchment filtering
-    # Use full time range (1970-2015) for evaporation-based filtering
-    vector_data, time_vec, catchment_ids, var_names = load_vector_data_from_parquet(
+    # Step 1: Load evaporation data (full time range: 1970-2015) to determine valid catchments
+    evap_vector_data, time_vec, catchment_ids, _ = load_vector_data_from_parquet(
         config.vector_file,
-        variables=['evaporation', 'discharge_vol'],  # Load both variables
+        variables=['evaporation'],
         start=datetime.strptime(config.train_start, '%Y-%m-%d'),  # 1970-01-01
         end=datetime.strptime(config.val_end, '%Y-%m-%d'),         # 2015-12-30
-        nan_ratio=0.05,  # Filter based on evaporation (which has full 1970-2015 data)
+        nan_ratio=0.05,
     )
+    evap_data = evap_vector_data[:, :, 0].T  # [num_catchments, num_days]
 
-    # Extract evaporation data: [num_days, num_catchments, 2] -> [num_catchments, num_days]
-    evap_idx = var_names.index('evaporation')
-    evap_data = vector_data[:, :, evap_idx].T  # [num_catchments, num_days]
-
-    # Extract riverflow data for the period 1989-2015
-    riverflow_idx = var_names.index('discharge_vol')
+    # Step 2: Load riverflow data (only from 1989 onwards) using same catchment IDs
     riverflow_start = config.riverflow_available_from if hasattr(config, 'riverflow_available_from') else '1989-01-01'
-    riverflow_start_date = datetime.strptime(riverflow_start, '%Y-%m-%d')
+    riverflow_vector_data, time_vec_river, catchment_ids_river, _ = load_vector_data_from_parquet(
+        config.vector_file,
+        variables=['discharge_vol'],
+        start=datetime.strptime(riverflow_start, '%Y-%m-%d'),     # 1989-01-01
+        end=datetime.strptime(config.val_end, '%Y-%m-%d'),         # 2015-12-30
+        nan_ratio=0.05,
+        fixed_catchment_ids=catchment_ids.tolist(),  # NEW: use same catchments as evap
+    )
+    riverflow_data_partial = riverflow_vector_data[:, :, 0].T  # [num_catchments, num_days_from_1989]
 
-    # Find the index in time_vec where riverflow data starts
-    riverflow_start_idx = 0
-    for i, date_str in enumerate(time_vec):
-        date = datetime.strptime(str(date_str), '%Y-%m-%d')
-        if date >= riverflow_start_date:
-            riverflow_start_idx = i
-            break
-
-    # Extract riverflow data from 1989 onwards
-    time_vec_river = time_vec[riverflow_start_idx:]
-    riverflow_data_partial = vector_data[riverflow_start_idx:, :, riverflow_idx].T  # [num_catchments, num_days_from_1989]
+    # Verify catchment IDs match
+    if not np.array_equal(catchment_ids, catchment_ids_river):
+        raise ValueError("Catchment IDs mismatch between evaporation and riverflow!")
 
     # Pad riverflow data with 0.0 for the 1970-1988 period (避免NaN进入网络)
     num_missing_days = len(time_vec) - len(time_vec_river)
