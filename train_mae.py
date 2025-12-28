@@ -198,8 +198,8 @@ def create_datasets(config, rank):
 
     # Safety check: Verify data alignment (确保time_vec在num_missing_days位置对应riverflow开始日期)
     if num_missing_days > 0:
-        expected_riverflow_start = pd.to_datetime(config.riverflow_available_from)
-        actual_alignment_date = pd.to_datetime(time_vec[num_missing_days])
+        expected_riverflow_start = datetime.strptime(config.riverflow_available_from, '%Y-%m-%d').date()
+        actual_alignment_date = datetime.strptime(str(time_vec[num_missing_days]), '%Y-%m-%d').date()
         assert actual_alignment_date == expected_riverflow_start, \
             f"Data alignment error: time_vec[{num_missing_days}] = {actual_alignment_date}, " \
             f"expected {expected_riverflow_start} (riverflow_available_from)"
