@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from typing import Optional
 
 
 class PositionalEncoding(nn.Module):
@@ -225,13 +226,14 @@ class CrossAttention(nn.Module):
         self.proj = nn.Linear(decoder_dim, decoder_dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+    def forward(self, x: Tensor, y: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Forward pass
 
         Args:
             x: [B, N_decoder, decoder_dim] - decoder queries
             y: [B, N_encoder, encoder_dim] - encoder keys/values
+            key_padding_mask: [B, N_encoder] - Optional mask for padded keys (True = padded/masked)
 
         Returns:
             output: [B, N_decoder, decoder_dim] - cross-attended features
@@ -251,6 +253,14 @@ class CrossAttention(nn.Module):
 
         # Attention
         attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, N, Ny]
+
+        # Apply key padding mask if provided
+        if key_padding_mask is not None:
+            # key_padding_mask: [B, Ny] -> [B, 1, 1, Ny] for broadcasting
+            # True = masked (should be ignored), set to -inf before softmax
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, Ny]
+            attn = attn.masked_fill(attn_mask, float('-inf'))
+
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -336,13 +346,14 @@ class CrossAttentionBlock(nn.Module):
             nn.Dropout(drop)
         )
 
-    def forward(self, x: Tensor, y: Tensor) -> Tensor:
+    def forward(self, x: Tensor, y: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tensor:
         """
         Forward pass
 
         Args:
             x: [B, N_decoder, decoder_dim] - decoder queries
             y: [B, N_encoder, encoder_dim] - encoder keys/values
+            key_padding_mask: [B, N_encoder] - Optional mask for padded keys (True = padded/masked)
 
         Returns:
             output: [B, N_decoder, decoder_dim] - processed features
@@ -352,8 +363,8 @@ class CrossAttentionBlock(nn.Module):
             x_norm = self.norm0(x)
             x = x + self.self_attn(x_norm, x_norm, x_norm, need_weights=False)[0]
 
-        # Cross-attention
-        x = x + self.cross_attn(self.norm1(x), y)
+        # Cross-attention (with key padding mask)
+        x = x + self.cross_attn(self.norm1(x), y, key_padding_mask=key_padding_mask)
 
         # MLP
         x = x + self.mlp(self.norm2(x))

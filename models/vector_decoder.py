@@ -132,7 +132,7 @@ class VectorModalityDecoder(nn.Module):
         # Prediction head (predicts for each catchment in patch)
         self.pred_head = nn.Linear(decoder_dim, patch_size)  # Predict patch_size values
 
-    def forward(self, encoder_output, mask_info: Dict, decoder_modality_token=None) -> Tensor:
+    def forward(self, encoder_output, mask_info: Dict, decoder_modality_token=None, key_padding_mask=None) -> Tensor:
         """
         Forward pass with patch-level mask
 
@@ -142,25 +142,34 @@ class VectorModalityDecoder(nn.Module):
                 - If use_weighted_fm=True: list of [B, L_visible, encoder_dim]
             mask_info: dict with 'mask' [B, num_patches, T], 'padding_mask' [B, L_visible]
             decoder_modality_token: [1, 1, decoder_dim] decoder modality token (optional)
+            key_padding_mask: [B, L_total] - Global padding mask from all modalities (True = padded)
 
         Returns:
             pred_vec: [B, num_catchments, T] - predicted time series for all catchments
         """
         if self.use_cross_attn:
-            return self._forward_cross_attn(encoder_output, mask_info, decoder_modality_token)
+            return self._forward_cross_attn(encoder_output, mask_info, decoder_modality_token, key_padding_mask)
         else:
             return self._forward_self_attn(encoder_output, mask_info, decoder_modality_token)
 
-    def _forward_cross_attn(self, encoder_output, mask_info: Dict, decoder_modality_token=None) -> Tensor:
+    def _forward_cross_attn(self, encoder_output, mask_info: Dict, decoder_modality_token=None, key_padding_mask=None) -> Tensor:
         """
         Vectorized CrossMAE decoder for vectors (NO LOOPS over batch!)
 
         Key optimization: Process entire batch in parallel instead of per-sample loops.
         Assumes fixed mask ratio, so all samples have same number of masked patches.
+
+        Args:
+            key_padding_mask: [B, L_total] - Global padding mask from all modalities (True = padded)
         """
         patch_mask = mask_info['mask']  # [B, num_patches, T]
-        padding_mask = mask_info.get('padding_mask')  # [B, L_visible]
+        padding_mask_local = mask_info.get('padding_mask')  # [B, L_visible] - local mask from this modality
         B, num_patches, T = patch_mask.shape
+
+        # Use global padding mask if provided, otherwise fall back to local
+        # IMPORTANT: key_padding_mask should match encoder_output length (which is fused_features in MultiModalMAE)
+        if key_padding_mask is None:
+            key_padding_mask = padding_mask_local
 
         # Calculate actual number of catchments (accounting for padding)
         num_padded = num_patches * self.patch_size
@@ -227,7 +236,8 @@ class VectorModalityDecoder(nn.Module):
                     batch_encoder = encoder_output  # [B, L_visible, encoder_dim]
 
             # CrossAttention now processes ENTIRE BATCH in parallel!
-            x = blk(x, batch_encoder)  # [B, k, decoder_dim]
+            # Pass key_padding_mask to prevent attention to padded positions
+            x = blk(x, batch_encoder, key_padding_mask=key_padding_mask)  # [B, k, decoder_dim]
 
         # ===== Step 3: Prediction =====
         x = self.decoder_norm(x)  # [B, k, decoder_dim]

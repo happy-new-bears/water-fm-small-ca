@@ -347,31 +347,36 @@ class MultiModalMAE(nn.Module):
         precip_pred = self.precip_decoder(
             fused_features,                          # ⭐ 改为fused_features
             precip_mask_info,
-            decoder_modality_token=self.decoder_modality_precip  # ⭐ 新增
+            decoder_modality_token=self.decoder_modality_precip,  # ⭐ 新增
+            key_padding_mask=all_padding_mask  # ⭐ 新增：传入全局padding mask
         )
         soil_pred = self.soil_decoder(
             fused_features,                          # ⭐ 改为fused_features
             soil_mask_info,
-            decoder_modality_token=self.decoder_modality_soil  # ⭐ 新增
+            decoder_modality_token=self.decoder_modality_soil,  # ⭐ 新增
+            key_padding_mask=all_padding_mask  # ⭐ 新增：传入全局padding mask
         )
         temp_pred = self.temp_decoder(
             fused_features,                          # ⭐ 改为fused_features
             temp_mask_info,
-            decoder_modality_token=self.decoder_modality_temp  # ⭐ 新增
+            decoder_modality_token=self.decoder_modality_temp,  # ⭐ 新增
+            key_padding_mask=all_padding_mask  # ⭐ 新增：传入全局padding mask
         )
 
         # Vector modalities
         evap_pred = self.evap_decoder(
             fused_features,
             evap_mask_info,
-            decoder_modality_token=self.decoder_modality_evap
+            decoder_modality_token=self.decoder_modality_evap,
+            key_padding_mask=all_padding_mask  # ⭐ 新增：传入全局padding mask
         )
 
         # Riverflow decoder - 始终运行
         riverflow_pred = self.riverflow_decoder(
             fused_features,
             riverflow_mask_info,
-            decoder_modality_token=self.decoder_modality_riverflow
+            decoder_modality_token=self.decoder_modality_riverflow,
+            key_padding_mask=all_padding_mask  # ⭐ 新增：传入全局padding mask
         )
 
         # ===== Compute losses =====
