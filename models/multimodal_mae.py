@@ -377,10 +377,13 @@ class MultiModalMAE(nn.Module):
         # ===== Compute losses =====
         loss_dict = {}
 
-        # Extract riverflow valid mask [B] (1.0=valid, 0.0=invalid)
+        # Extract riverflow valid mask [B] (bool: True=valid, False=invalid)
         riverflow_valid_mask = batch.get('riverflow_valid_mask', None)  # [B]
         if riverflow_valid_mask is not None:
             riverflow_valid_mask = riverflow_valid_mask.to(device)
+        else:
+            # 如果没传（比如测试脚本），默认全部有效
+            riverflow_valid_mask = torch.ones(batch['precip'].shape[0], device=device, dtype=torch.bool)
 
         # Image losses
         loss_dict['precip_loss'] = self._compute_image_loss(
@@ -469,7 +472,7 @@ class MultiModalMAE(nn.Module):
         pred_vec: Tensor,
         target_vec: Tensor,
         mask: Tensor,
-        valid_sample_mask: Tensor = None  # NEW: [B] 标记哪些sample有有效数据
+        valid_sample_mask: Tensor = None  # NEW: [B] bool标记哪些sample有有效数据
     ) -> Tensor:
         """
         Compute reconstruction loss for vector modality
@@ -478,7 +481,7 @@ class MultiModalMAE(nn.Module):
             pred_vec: [B, num_catchments, T] predicted values (unpatchified)
             target_vec: [B, num_patches, patch_size, T] target values (patchified)
             mask: [B, num_patches, T] bool mask (True=masked patch)
-            valid_sample_mask: [B] float tensor (1.0=valid, 0.0=invalid)
+            valid_sample_mask: [B] bool tensor (True=valid, False=invalid)
 
         Returns:
             Scalar loss (only on masked positions and valid samples)
@@ -509,12 +512,13 @@ class MultiModalMAE(nn.Module):
         # 计算每个sample的loss [B]
         per_sample_loss = masked_loss_map.sum(dim=(1, 2)) / (mask_unpatch.sum(dim=(1, 2)) + 1e-6)
 
-        # NEW: 应用valid_sample_mask
+        # NEW: 应用valid_sample_mask (将无效样本的loss置为0)
         if valid_sample_mask is not None:
-            # valid_sample_mask: [B], per_sample_loss: [B]
-            per_sample_loss = per_sample_loss * valid_sample_mask
-            # 只对有效sample求平均
-            num_valid = valid_sample_mask.sum()
+            # valid_sample_mask: [B] bool, per_sample_loss: [B] float
+            # 转换bool为float: True->1.0, False->0.0
+            per_sample_loss = per_sample_loss * valid_sample_mask.float()
+            # 只对有效sample求平均 (分母是有效样本数，不是batch size)
+            num_valid = valid_sample_mask.float().sum()
             final_loss = per_sample_loss.sum() / (num_valid + 1e-6)
         else:
             # 向后兼容：如果没有提供valid_sample_mask，所有sample都视为有效

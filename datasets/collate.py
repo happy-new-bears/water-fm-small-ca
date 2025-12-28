@@ -189,18 +189,13 @@ class MultiScaleMaskedCollate:
                     truncated[key] = val
             truncated_batch.append(truncated)
 
-        # NEW: 收集每个sample的riverflow_valid标记
-        riverflow_valid_list = []
-        for sample in truncated_batch:
-            # riverflow_valid: True/False or 1.0/0.0
-            valid = sample.get('riverflow_valid', True)
-            # 转换为float (1.0 or 0.0)
-            riverflow_valid_list.append(float(valid) if isinstance(valid, bool) else valid)
+        # NEW: 收集每个sample的riverflow_valid标记 (List[bool])
+        has_riverflow = [not sample.get('riverflow_missing', False) for sample in truncated_batch]
 
         # Step 2: Generate masks
         # Both train and val use masking, but val uses fixed seed for reproducibility
-        # 不再需要传入 riverflow_missing，所有modality都正常mask
-        masks = self._generate_masks(B, seq_len, num_vec_patches)
+        # 传入 has_riverflow 列表，为无效样本设置100% mask
+        masks = self._generate_masks(B, seq_len, num_vec_patches, has_riverflow)
 
         # Step 3: Stack into batch
         batch_dict = {}
@@ -237,17 +232,17 @@ class MultiScaleMaskedCollate:
         batch_dict['seq_len'] = seq_len
         batch_dict['num_vec_patches'] = num_vec_patches
         batch_dict['vector_patch_size'] = truncated_batch[0]['patch_size']
-        # NEW: riverflow_valid_mask [B] - 标记每个sample的riverflow有效性
-        batch_dict['riverflow_valid_mask'] = torch.tensor(riverflow_valid_list, dtype=torch.float32)
+        # NEW: riverflow_valid_mask [B] - 标记每个sample的riverflow有效性 (bool类型)
+        batch_dict['riverflow_valid_mask'] = torch.tensor(has_riverflow, dtype=torch.bool)
 
         return batch_dict
 
-    def _generate_masks(self, B: int, seq_len: int, num_vec_patches: int) -> Dict[str, np.ndarray]:
+    def _generate_masks(self, B: int, seq_len: int, num_vec_patches: int, has_riverflow: list) -> Dict[str, np.ndarray]:
         """
         Generate masks for each modality
 
-        所有modality都正常生成mask，不再特殊处理riverflow
-        riverflow的有效性通过loss计算时的valid_mask来控制
+        对于riverflow: 如果样本无效(has_riverflow[i]=False)，设置100% mask (全True)
+        这样encoder会看到全masked的输入，不会学到无效数据
 
         Args:
             B: batch size
@@ -269,16 +264,36 @@ class MultiScaleMaskedCollate:
                 masks[mod] = image_mask.copy()
 
             # For vectors: generate patch-level temporal mask [B, num_patches, T]
-            vector_mask = self._generate_vector_mask(B, seq_len, num_vec_patches)
+            base_vector_mask = self._generate_vector_mask(B, seq_len, num_vec_patches)
+
             for mod in self.vector_modalities:
-                masks[mod] = vector_mask.copy()
+                if mod == 'riverflow':
+                    # 为riverflow特殊处理：无效样本设置100% mask
+                    mod_mask = base_vector_mask.copy()
+                    for i in range(B):
+                        if not has_riverflow[i]:
+                            mod_mask[i] = True  # 100% masked (全True)
+                    masks[mod] = mod_mask
+                else:
+                    # 其他vector modality (evap)正常处理
+                    masks[mod] = base_vector_mask.copy()
 
         elif self.mask_mode == 'independent':
             # Each modality has independent mask
             for mod in self.image_modalities:
                 masks[mod] = self._generate_image_mask(B, seq_len)
+
             for mod in self.vector_modalities:
-                masks[mod] = self._generate_vector_mask(B, seq_len, num_vec_patches)
+                if mod == 'riverflow':
+                    # 先生成基础mask
+                    mod_mask = self._generate_vector_mask(B, seq_len, num_vec_patches)
+                    # 为无效样本设置100% mask
+                    for i in range(B):
+                        if not has_riverflow[i]:
+                            mod_mask[i] = True  # 100% masked
+                    masks[mod] = mod_mask
+                else:
+                    masks[mod] = self._generate_vector_mask(B, seq_len, num_vec_patches)
 
         return masks
 
