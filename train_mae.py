@@ -167,23 +167,25 @@ def create_datasets(config, rank):
         print("=" * 60)
 
     # Load evaporation data (full time range: 1970-2015)
+    # Use higher nan_ratio to avoid filtering out catchments with missing riverflow in early period
     evap_vector_data, time_vec, catchment_ids, _ = load_vector_data_from_parquet(
         config.vector_file,
         variables=['evaporation'],
         start=datetime.strptime(config.train_start, '%Y-%m-%d'),  # 1970-01-01
         end=datetime.strptime(config.val_end, '%Y-%m-%d'),         # 2015-12-30
-        nan_ratio=0.05,
+        nan_ratio=0.5,  # Increased from 0.05 to allow catchments with some missing data
     )
     evap_data = evap_vector_data[:, :, 0].T  # [num_catchments, num_days]
 
     # Load riverflow data (only from 1989 onwards)
+    # Use same nan_ratio as evap to ensure consistent catchment filtering
     riverflow_start = config.riverflow_available_from if hasattr(config, 'riverflow_available_from') else '1989-01-01'
     riverflow_vector_data, time_vec_river, catchment_ids_river, _ = load_vector_data_from_parquet(
         config.vector_file,
         variables=['discharge_vol'],
         start=datetime.strptime(riverflow_start, '%Y-%m-%d'),     # 1989-01-01
         end=datetime.strptime(config.val_end, '%Y-%m-%d'),         # 2015-12-30
-        nan_ratio=0.05,
+        nan_ratio=0.5,  # Increased from 0.05 to match evap filtering
     )
     riverflow_data_partial = riverflow_vector_data[:, :, 0].T  # [num_catchments, num_days_from_1989]
 
