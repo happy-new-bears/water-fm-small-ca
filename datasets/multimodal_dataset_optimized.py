@@ -444,19 +444,12 @@ class MultiModalHydroDatasetOptimized(Dataset):
 
         elif modality == 'riverflow':
             # Riverflow: Log transform + global normalization
-            # IMPORTANT: Handle NaN values (from 1970-1988 missing period)
+            # Note: 缺失数据已被填充为0，不再有NaN
             eps = 1e-6
-            # Create mask for NaN values
-            nan_mask = torch.isnan(data_tensor)
-            # Replace NaN with 0 temporarily for log transform
-            data_safe = torch.where(nan_mask, torch.zeros_like(data_tensor), data_tensor)
-            # Apply log transform
-            data_log = torch.log(data_safe + eps)
+            data_log = torch.log(data_tensor + eps)  # log(0 + eps) ≈ -13.8
             mean = self.stats['riverflow_log_mean']  # Scalar
             std = self.stats['riverflow_log_std']    # Scalar
             normalized = (data_log - mean) / (std + 1e-8)
-            # Restore NaN values (will be masked later)
-            normalized = torch.where(nan_mask, torch.full_like(normalized, float('nan')), normalized)
 
         else:
             raise ValueError(f"Unknown modality: {modality}")
@@ -625,11 +618,12 @@ class MultiModalHydroDatasetOptimized(Dataset):
             'soil': soil_norm,
             'temp': temp_norm,
             'evap': evap_patches,
-            'riverflow': riverflow_patches,  # Still returned even if missing (will be masked)
+            'riverflow': riverflow_patches,  # Always returned (filled with 0 if missing)
             'static_attr': static_patches,
             'catchment_padding_mask': padding_mask,
             'num_patches': self.num_patches,
             'patch_size': self.patch_size,
-            'start_date': start_date,  # Already computed above
-            'riverflow_missing': riverflow_missing,  # NEW: flag for riverflow availability
+            'start_date': start_date,
+            'riverflow_missing': riverflow_missing,  # 保留向后兼容
+            'riverflow_valid': not riverflow_missing,  # NEW: 明确的有效性标记 (float: 0.0 or 1.0)
         }

@@ -191,14 +191,14 @@ def create_datasets(config, rank):
     if not np.array_equal(catchment_ids, catchment_ids_river):
         raise ValueError("Catchment IDs mismatch between evaporation and riverflow!")
 
-    # Pad riverflow data with NaN for the 1970-1988 period
+    # Pad riverflow data with 0.0 for the 1970-1988 period (避免NaN进入网络)
     num_missing_days = len(time_vec) - len(time_vec_river)
-    riverflow_data = np.full((riverflow_data_partial.shape[0], len(time_vec)), np.nan, dtype=np.float32)
+    riverflow_data = np.full((riverflow_data_partial.shape[0], len(time_vec)), 0.0, dtype=np.float32)
     riverflow_data[:, num_missing_days:] = riverflow_data_partial
 
     if rank == 0:
         print(f"✓ Riverflow data padded: {riverflow_data.shape}")
-        print(f"  - Missing period (1970-1988): {num_missing_days} days filled with NaN")
+        print(f"  - Missing period (1970-1988): {num_missing_days} days filled with 0.0")
         print(f"  - Valid period (1989-2015): {len(time_vec_river)} days with real data")
 
     if rank == 0:

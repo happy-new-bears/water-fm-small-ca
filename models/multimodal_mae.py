@@ -265,17 +265,16 @@ class MultiModalMAE(nn.Module):
                 - 'evap', 'riverflow': [B, T] vector data
                 - 'static_attr': [B, stat_dim] static attributes
                 - '*_mask': [B, T, num_patches] or [B, T] masks (True=masked)
-                - 'riverflow_missing': bool, whether riverflow data is missing (NEW)
+                - 'riverflow_valid_mask': [B] per-sample validity (1.0=valid, 0.0=invalid) (NEW)
 
         Returns:
             total_loss: Scalar total loss
             loss_dict: Dictionary of individual losses for each modality
         """
 
-        # NEW: Get riverflow_missing flag
-        riverflow_missing = batch.get('riverflow_missing', False)
-
         # ===== Encode all modalities =====
+        # 始终运行所有encoder，确保计算图一致（DDP稳定性）
+
         # Image modalities
         precip_token, precip_mask_info = self.precip_encoder(
             batch['precip'], batch['precip_mask']
@@ -292,41 +291,25 @@ class MultiModalMAE(nn.Module):
             batch['evap'], batch['static_attr'], batch['evap_mask']
         )
 
-        # NEW: Riverflow encoder - skip if data is missing
-        if not riverflow_missing:
-            riverflow_token, riverflow_mask_info = self.riverflow_encoder(
-                batch['riverflow'], batch['static_attr'], batch['riverflow_mask']
-            )
-        else:
-            # Riverflow missing: skip encoder entirely
-            riverflow_token = None
-            riverflow_mask_info = None
+        # Riverflow encoder - 始终运行（缺失数据已填充为0）
+        riverflow_token, riverflow_mask_info = self.riverflow_encoder(
+            batch['riverflow'], batch['static_attr'], batch['riverflow_mask']
+        )
 
         # ===== Shared Fusion Layers =====
         # Step 1: 获取batch size和device
         B = precip_token.shape[0]
         device = precip_token.device
 
-        # Step 2: 拼接所有模态的visible tokens
+        # Step 2: 拼接所有模态的visible tokens (始终5个modality)
         # 保留 Vector modality 的 static token（包含重要的全局静态环境信息）
-        # NEW: Conditionally include riverflow tokens
-        if riverflow_token is not None:
-            # Normal case: 5 modalities
-            all_tokens = torch.cat([
-                precip_token,              # [B, L_precip, d_model]
-                soil_token,                # [B, L_soil, d_model]
-                temp_token,                # [B, L_temp, d_model]
-                evap_token,                # [B, L_evap, d_model] 保留 static token
-                riverflow_token            # [B, L_river, d_model] 保留 static token
-            ], dim=1)  # [B, L_total, d_model]
-        else:
-            # Riverflow missing: only 4 modalities
-            all_tokens = torch.cat([
-                precip_token,              # [B, L_precip, d_model]
-                soil_token,                # [B, L_soil, d_model]
-                temp_token,                # [B, L_temp, d_model]
-                evap_token,                # [B, L_evap, d_model] 保留 static token
-            ], dim=1)  # [B, L_total, d_model]
+        all_tokens = torch.cat([
+            precip_token,              # [B, L_precip, d_model]
+            soil_token,                # [B, L_soil, d_model]
+            temp_token,                # [B, L_temp, d_model]
+            evap_token,                # [B, L_evap, d_model] 保留 static token
+            riverflow_token            # [B, L_river, d_model] 保留 static token (即使数据是0填充)
+        ], dim=1)  # [B, L_total, d_model]
 
         # Step 3: 创建padding mask (拼接各自的padding mask)
         # 从mask_info中获取padding_mask，如果没有则创建全False的mask
@@ -338,28 +321,17 @@ class MultiModalMAE(nn.Module):
             torch.zeros(B, temp_token.shape[1], device=device, dtype=torch.bool))
         evap_pad = evap_mask_info.get('padding_mask',
             torch.zeros(B, evap_token.shape[1], device=device, dtype=torch.bool))
+        riverflow_pad = riverflow_mask_info.get('padding_mask',
+            torch.zeros(B, riverflow_token.shape[1], device=device, dtype=torch.bool))
 
-        # NEW: Conditionally include riverflow padding mask
-        if riverflow_mask_info is not None:
-            riverflow_pad = riverflow_mask_info.get('padding_mask',
-                torch.zeros(B, riverflow_token.shape[1], device=device, dtype=torch.bool))
-
-            # 保留完整的 padding mask（包括 static token 的 mask）
-            all_padding_mask = torch.cat([
-                precip_pad,
-                soil_pad,
-                temp_pad,
-                evap_pad,          # 包含 static token 的 mask
-                riverflow_pad      # 包含 static token 的 mask
-            ], dim=1)  # [B, L_total]
-        else:
-            # Riverflow missing: only 4 modalities
-            all_padding_mask = torch.cat([
-                precip_pad,
-                soil_pad,
-                temp_pad,
-                evap_pad,          # 包含 static token 的 mask
-            ], dim=1)  # [B, L_total]
+        # 保留完整的 padding mask（包括 static token 的 mask）
+        all_padding_mask = torch.cat([
+            precip_pad,
+            soil_pad,
+            temp_pad,
+            evap_pad,          # 包含 static token 的 mask
+            riverflow_pad      # 包含 static token 的 mask
+        ], dim=1)  # [B, L_total]
 
         # Step 4: 通过shared transformer进行跨模态融合
         fused_features = all_tokens
@@ -390,23 +362,25 @@ class MultiModalMAE(nn.Module):
 
         # Vector modalities
         evap_pred = self.evap_decoder(
-            fused_features,                          # ⭐ 改为fused_features
+            fused_features,
             evap_mask_info,
-            decoder_modality_token=self.decoder_modality_evap  # ⭐ 新增
+            decoder_modality_token=self.decoder_modality_evap
         )
 
-        # NEW: Riverflow decoder - skip if data is missing
-        if not riverflow_missing:
-            riverflow_pred = self.riverflow_decoder(
-                fused_features,                          # ⭐ 改为fused_features
-                riverflow_mask_info,
-                decoder_modality_token=self.decoder_modality_riverflow  # ⭐ 新增
-            )
-        else:
-            riverflow_pred = None  # Skip decoder entirely
+        # Riverflow decoder - 始终运行
+        riverflow_pred = self.riverflow_decoder(
+            fused_features,
+            riverflow_mask_info,
+            decoder_modality_token=self.decoder_modality_riverflow
+        )
 
         # ===== Compute losses =====
         loss_dict = {}
+
+        # Extract riverflow valid mask [B] (1.0=valid, 0.0=invalid)
+        riverflow_valid_mask = batch.get('riverflow_valid_mask', None)  # [B]
+        if riverflow_valid_mask is not None:
+            riverflow_valid_mask = riverflow_valid_mask.to(device)
 
         # Image losses
         loss_dict['precip_loss'] = self._compute_image_loss(
@@ -424,14 +398,11 @@ class MultiModalMAE(nn.Module):
             evap_pred, batch['evap'], batch['evap_mask']
         )
 
-        # NEW: Riverflow loss - only compute if data is available
-        if not riverflow_missing:
-            loss_dict['riverflow_loss'] = self._compute_vector_loss(
-                riverflow_pred, batch['riverflow'], batch['riverflow_mask']
-            )
-        else:
-            # Riverflow missing: set loss to 0 (no gradient)
-            loss_dict['riverflow_loss'] = torch.tensor(0.0, device=device, dtype=precip_pred.dtype)
+        # Riverflow loss - 始终计算，使用valid_sample_mask控制哪些sample贡献loss
+        loss_dict['riverflow_loss'] = self._compute_vector_loss(
+            riverflow_pred, batch['riverflow'], batch['riverflow_mask'],
+            valid_sample_mask=riverflow_valid_mask  # NEW: pass per-sample validity
+        )
 
         # Total loss with task weights
         total_loss = 0.0
@@ -439,9 +410,7 @@ class MultiModalMAE(nn.Module):
 
         for key, value in loss_dict.items():
             weight = task_weights.get(key, 1.0)  # Default weight is 1.0
-            # NEW: Skip riverflow loss if missing (weight * 0 = 0, but explicit check is clearer)
-            if key == 'riverflow_loss' and riverflow_missing:
-                continue  # Don't add to total loss
+            # NOTE: riverflow_loss已通过valid_sample_mask在计算时屏蔽，直接加入total_loss即可
             total_loss += weight * value
 
         loss_dict['total_loss'] = total_loss
@@ -499,7 +468,8 @@ class MultiModalMAE(nn.Module):
         self,
         pred_vec: Tensor,
         target_vec: Tensor,
-        mask: Tensor
+        mask: Tensor,
+        valid_sample_mask: Tensor = None  # NEW: [B] 标记哪些sample有有效数据
     ) -> Tensor:
         """
         Compute reconstruction loss for vector modality
@@ -508,9 +478,10 @@ class MultiModalMAE(nn.Module):
             pred_vec: [B, num_catchments, T] predicted values (unpatchified)
             target_vec: [B, num_patches, patch_size, T] target values (patchified)
             mask: [B, num_patches, T] bool mask (True=masked patch)
+            valid_sample_mask: [B] float tensor (1.0=valid, 0.0=invalid)
 
         Returns:
-            Scalar loss (only on masked positions)
+            Scalar loss (only on masked positions and valid samples)
         """
         # Unpatchify target: [B, num_patches, patch_size, T] -> [B, num_catchments, T]
         B, num_patches, patch_size, T = target_vec.shape
@@ -529,16 +500,27 @@ class MultiModalMAE(nn.Module):
         mask_flat = mask_expanded.reshape(B, num_padded, T)  # [B, num_padded, T]
         mask_unpatch = mask_flat[:, :num_actual, :]  # [B, 604, T]
 
-        # MSE loss
-        loss = F.mse_loss(
-            pred_vec, target_unpatch, reduction='none'
-        )  # [B, num_catchments, T]
+        # MSE loss (reduction='none') -> [B, num_catchments, T]
+        loss = F.mse_loss(pred_vec, target_unpatch, reduction='none')
 
-        # Only compute loss on masked positions
-        # Use 1e-6 instead of 1e-8 for FP16 compatibility
-        masked_loss = (loss * mask_unpatch.float()).sum() / (mask_unpatch.sum() + 1e-6)
+        # 只计算被mask的部分: [B, num_catchments, T]
+        masked_loss_map = loss * mask_unpatch.float()
 
-        return masked_loss
+        # 计算每个sample的loss [B]
+        per_sample_loss = masked_loss_map.sum(dim=(1, 2)) / (mask_unpatch.sum(dim=(1, 2)) + 1e-6)
+
+        # NEW: 应用valid_sample_mask
+        if valid_sample_mask is not None:
+            # valid_sample_mask: [B], per_sample_loss: [B]
+            per_sample_loss = per_sample_loss * valid_sample_mask
+            # 只对有效sample求平均
+            num_valid = valid_sample_mask.sum()
+            final_loss = per_sample_loss.sum() / (num_valid + 1e-6)
+        else:
+            # 向后兼容：如果没有提供valid_sample_mask，所有sample都视为有效
+            final_loss = per_sample_loss.mean()
+
+        return final_loss
 
 
 if __name__ == '__main__':
