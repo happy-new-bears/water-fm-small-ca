@@ -186,21 +186,39 @@ class VectorModalityDecoder(nn.Module):
             # Standard: single encoder output [B, L_visible, encoder_dim]
             encoder_features_per_layer = None
 
-        # ===== Step 1: VECTORIZED Query Creation (NO LOOPS!) =====
-        # Assumption: Fixed mask ratio means each sample has same number of masked patch-times
-        num_masked_total = patch_mask.sum().item()
-        num_masked_per_sample = num_masked_total // B
+        # ===== Step 1: VECTORIZED Query Creation (handle variable-length masked sequences) =====
+        # Calculate number of masked positions per sample
+        num_masked_per_sample = patch_mask.sum(dim=(1, 2))  # [B]
+        max_masked = num_masked_per_sample.max().item()
 
         # Get all masked positions
         # nonzero() returns indices in order (b, p, t), which we rely on
         indices = patch_mask.nonzero(as_tuple=False)  # [Total_Masked, 3]
 
-        # Extract p and t indices for Position Embedding
-        p_indices = indices[:, 1].view(B, num_masked_per_sample)  # [B, k] patch indices
-        t_indices = indices[:, 2].view(B, num_masked_per_sample)  # [B, k] time indices
+        # Extract p and t indices (flattened 1D tensors)
+        p_indices_flat = indices[:, 1]  # [Total_Masked]
+        t_indices_flat = indices[:, 2]  # [Total_Masked]
+
+        # Check if all samples have same number of masked positions
+        if (num_masked_per_sample == max_masked).all():
+            # FAST PATH: All samples have same length, no padding needed
+            p_indices = p_indices_flat.view(B, max_masked)  # [B, k]
+            t_indices = t_indices_flat.view(B, max_masked)  # [B, k]
+        else:
+            # SLOW PATH: Different lengths, need padding
+            p_indices = torch.zeros(B, max_masked, device=patch_mask.device, dtype=torch.long)
+            t_indices = torch.zeros(B, max_masked, device=patch_mask.device, dtype=torch.long)
+
+            offset = 0
+            for b in range(B):
+                length = num_masked_per_sample[b].item()
+                p_indices[b, :length] = p_indices_flat[offset:offset+length]
+                t_indices[b, :length] = t_indices_flat[offset:offset+length]
+                # Padded positions will have index 0 (dummy values)
+                offset += length
 
         # Create Queries [B, k, decoder_dim]
-        queries = self.mask_token.expand(B, num_masked_per_sample, -1).clone()
+        queries = self.mask_token.expand(B, max_masked, -1).clone()
 
         # Add Spatial PE (Gathering, NO LOOP!)
         # self.spatial_pos: [1, num_patches, decoder_dim]
@@ -243,7 +261,7 @@ class VectorModalityDecoder(nn.Module):
         x = self.decoder_norm(x)  # [B, k, decoder_dim]
         predictions_patch = self.pred_head(x)  # [B, k, patch_size]
 
-        # ===== Step 4: Scatter back & Unpatchify (VECTORIZED!) =====
+        # ===== Step 4: Scatter back & Unpatchify (handle variable-length predictions) =====
         device = predictions_patch.device
         dtype = predictions_patch.dtype
 
@@ -251,9 +269,28 @@ class VectorModalityDecoder(nn.Module):
         # This shape makes it easier to assign using boolean indexing
         pred_grid = torch.zeros(B, num_patches, T, self.patch_size, device=device, dtype=dtype)
 
-        # patch_mask is [B, num_patches, T], use as index
-        # predictions_patch is [B, k, patch_size] -> flatten -> [Total_Masked, patch_size]
-        pred_grid[patch_mask] = predictions_patch.reshape(-1, self.patch_size)
+        # Handle variable-length predictions
+        if (num_masked_per_sample == max_masked).all():
+            # FAST PATH: All samples have same length, direct reshape
+            # predictions_patch is [B, k, patch_size] -> flatten -> [Total_Masked, patch_size]
+            pred_grid[patch_mask] = predictions_patch.reshape(-1, self.patch_size)
+        else:
+            # SLOW PATH: Different lengths, need to handle per-sample
+            # Extract only valid predictions (exclude padding)
+            offset = 0
+            all_preds = []
+            for b in range(B):
+                length = num_masked_per_sample[b].item()
+                # predictions_patch[b, :length] are valid predictions
+                valid_preds = predictions_patch[b, :length]  # [length, patch_size]
+                all_preds.append(valid_preds)
+                offset += length
+
+            # Concatenate all valid predictions
+            all_preds_cat = torch.cat(all_preds, dim=0)  # [Total_Masked_Actual, patch_size]
+
+            # Scatter to grid
+            pred_grid[patch_mask] = all_preds_cat
 
         # Now convert back to [B, num_catchments, T]
         # [B, num_patches, T, patch_size] -> [B, num_patches, patch_size, T]
