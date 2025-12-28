@@ -146,6 +146,10 @@ class MultiScaleMaskedCollate:
         B = len(batch_list)
         seq_len = self.seq_len
 
+        # NEW: Check if riverflow is missing in this batch
+        # If ANY sample in the batch has riverflow_missing=True, treat the entire batch as missing
+        riverflow_missing = any(sample.get('riverflow_missing', False) for sample in batch_list)
+
         # Step 1: Truncate/pad data to fixed sequence length and extract metadata
         truncated_batch = []
         num_vec_patches = None  # Will be set from first sample
@@ -191,7 +195,8 @@ class MultiScaleMaskedCollate:
 
         # Step 2: Generate masks
         # Both train and val use masking, but val uses fixed seed for reproducibility
-        masks = self._generate_masks(B, seq_len, num_vec_patches)
+        # NEW: Pass riverflow_missing flag to mask generation
+        masks = self._generate_masks(B, seq_len, num_vec_patches, riverflow_missing)
 
         # Step 3: Stack into batch
         batch_dict = {}
@@ -228,10 +233,11 @@ class MultiScaleMaskedCollate:
         batch_dict['seq_len'] = seq_len
         batch_dict['num_vec_patches'] = num_vec_patches
         batch_dict['vector_patch_size'] = truncated_batch[0]['patch_size']
+        batch_dict['riverflow_missing'] = riverflow_missing  # NEW: riverflow availability flag
 
         return batch_dict
 
-    def _generate_masks(self, B: int, seq_len: int, num_vec_patches: int) -> Dict[str, np.ndarray]:
+    def _generate_masks(self, B: int, seq_len: int, num_vec_patches: int, riverflow_missing: bool = False) -> Dict[str, np.ndarray]:
         """
         Generate masks for each modality
 
@@ -239,6 +245,7 @@ class MultiScaleMaskedCollate:
             B: batch size
             seq_len: sequence length
             num_vec_patches: number of spatial patches for vectors
+            riverflow_missing: whether riverflow data is missing (NEW)
 
         Returns:
             Dictionary with:
@@ -257,14 +264,22 @@ class MultiScaleMaskedCollate:
             # For vectors: generate patch-level temporal mask [B, num_patches, T]
             vector_mask = self._generate_vector_mask(B, seq_len, num_vec_patches)
             for mod in self.vector_modalities:
-                masks[mod] = vector_mask.copy()
+                if mod == 'riverflow' and riverflow_missing:
+                    # NEW: Riverflow missing -> 100% mask (all True)
+                    masks[mod] = np.ones((B, num_vec_patches, seq_len), dtype=bool)
+                else:
+                    masks[mod] = vector_mask.copy()
 
         elif self.mask_mode == 'independent':
             # Each modality has independent mask
             for mod in self.image_modalities:
                 masks[mod] = self._generate_image_mask(B, seq_len)
             for mod in self.vector_modalities:
-                masks[mod] = self._generate_vector_mask(B, seq_len, num_vec_patches)
+                if mod == 'riverflow' and riverflow_missing:
+                    # NEW: Riverflow missing -> 100% mask (all True)
+                    masks[mod] = np.ones((B, num_vec_patches, seq_len), dtype=bool)
+                else:
+                    masks[mod] = self._generate_vector_mask(B, seq_len, num_vec_patches)
 
         return masks
 

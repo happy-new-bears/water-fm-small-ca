@@ -61,6 +61,8 @@ class MultiModalHydroDatasetOptimized(Dataset):
         # Other
         split: str = 'train',
         cache_to_memory: bool = True,
+        # Riverflow availability
+        riverflow_available_from: str = '1989-01-01',  # NEW: riverflow data start date
     ):
         super().__init__()
 
@@ -71,9 +73,15 @@ class MultiModalHydroDatasetOptimized(Dataset):
         self.cache_to_memory = cache_to_memory
         self.patch_size = patch_size
 
+        # NEW: Store riverflow availability date
+        self.riverflow_available_from = datetime.strptime(riverflow_available_from, '%Y-%m-%d')
+
         print(f"\n{'='*60}")
         print(f"Initializing ULTRA-OPTIMIZED dataset (split: {split})")
         print(f"{'='*60}")
+
+        # NEW: Print riverflow availability info
+        print(f"⚠️  Riverflow data available from: {riverflow_available_from}")
 
         # Generate date list
         self.date_list = self._generate_date_list(start_date, end_date)
@@ -338,36 +346,65 @@ class MultiModalHydroDatasetOptimized(Dataset):
         evap_data: np.ndarray,
         riverflow_data: np.ndarray
     ) -> Dict[str, torch.Tensor]:
-        """Compute per-catchment statistics for vector modalities"""
-        evap_means, evap_stds = [], []
-        riverflow_means, riverflow_stds = [], []
+        """
+        Compute GLOBAL statistics for vector modalities
 
-        for catch_idx in range(self.num_catchments):
-            # Evaporation
-            evap = evap_data[catch_idx]
-            valid_evap = evap[~np.isnan(evap)]
-            if len(valid_evap) > 0:
-                evap_means.append(valid_evap.mean())
-                evap_stds.append(valid_evap.std())
-            else:
-                evap_means.append(0.0)
-                evap_stds.append(1.0)
+        Key changes:
+        1. Evaporation: Global mean/std across all catchments and ALL time (1970-2015)
+        2. Riverflow: Only use data from riverflow_available_from onwards (1989-2015)
+                     Apply log transform first, then global mean/std (stabilizes extreme values)
 
-            # Riverflow
-            river = riverflow_data[catch_idx]
-            valid_river = river[~np.isnan(river)]
-            if len(valid_river) > 0:
-                riverflow_means.append(valid_river.mean())
-                riverflow_stds.append(valid_river.std())
-            else:
-                riverflow_means.append(0.0)
-                riverflow_stds.append(1.0)
+        Args:
+            evap_data: [num_catchments, num_days] evaporation data (full time range)
+            riverflow_data: [num_catchments, num_days] riverflow data (may have missing early period)
+
+        Returns:
+            Dictionary with global statistics (scalars, not per-catchment vectors)
+        """
+        # Evaporation: Global normalization across all catchments and ALL time
+        valid_evap = evap_data[~np.isnan(evap_data)]
+        if len(valid_evap) > 0:
+            evap_mean = float(valid_evap.mean())
+            evap_std = float(valid_evap.std())
+        else:
+            evap_mean = 0.0
+            evap_std = 1.0
+
+        # NEW: Riverflow statistics - only use data from riverflow_available_from onwards
+        # Find the index where riverflow becomes available
+        riverflow_start_idx = 0
+        for i, date in enumerate(self.date_list):
+            if date >= self.riverflow_available_from:
+                riverflow_start_idx = i
+                break
+
+        print(f"    Riverflow stats computed from index {riverflow_start_idx} "
+              f"(date: {self.date_list[riverflow_start_idx]}) onwards")
+
+        # Only use riverflow data from riverflow_start_idx onwards
+        riverflow_valid_period = riverflow_data[:, riverflow_start_idx:]  # [num_catchments, valid_days]
+
+        # Riverflow: Log transform + Global normalization
+        # Apply log(x + eps) to handle zeros and stabilize large values (e.g., floods)
+        eps = 1e-6
+        riverflow_log = np.log(riverflow_valid_period + eps)
+
+        # Filter out invalid values (NaN and Inf)
+        valid_river_log = riverflow_log[~np.isnan(riverflow_log) & ~np.isinf(riverflow_log)]
+        if len(valid_river_log) > 0:
+            riverflow_log_mean = float(valid_river_log.mean())
+            riverflow_log_std = float(valid_river_log.std())
+            print(f"    Riverflow: computed from {len(valid_river_log)} valid values")
+        else:
+            riverflow_log_mean = 0.0
+            riverflow_log_std = 1.0
+            print(f"    ⚠️  WARNING: No valid riverflow data found!")
 
         return {
-            'evap_mean': torch.tensor(evap_means, dtype=torch.float32),
-            'evap_std': torch.tensor(evap_stds, dtype=torch.float32),
-            'riverflow_mean': torch.tensor(riverflow_means, dtype=torch.float32),
-            'riverflow_std': torch.tensor(riverflow_stds, dtype=torch.float32),
+            'evap_mean': torch.tensor(evap_mean, dtype=torch.float32),              # Scalar
+            'evap_std': torch.tensor(evap_std, dtype=torch.float32),                # Scalar
+            'riverflow_log_mean': torch.tensor(riverflow_log_mean, dtype=torch.float32),  # Scalar
+            'riverflow_log_std': torch.tensor(riverflow_log_std, dtype=torch.float32),    # Scalar
         }
 
     def _compute_static_stats(self) -> Dict[str, torch.Tensor]:
@@ -387,7 +424,7 @@ class MultiModalHydroDatasetOptimized(Dataset):
         modality: str
     ) -> torch.Tensor:
         """
-        Pre-normalize vector data using TORCH (done once in __init__)
+        Pre-normalize vector data using GLOBAL statistics
 
         Args:
             data: [num_catchments, num_days] numpy array
@@ -398,11 +435,31 @@ class MultiModalHydroDatasetOptimized(Dataset):
         """
         # Convert to torch first
         data_tensor = torch.from_numpy(data).float()
-        means = self.stats[f'{modality}_mean']  # [num_catchments]
-        stds = self.stats[f'{modality}_std']    # [num_catchments]
 
-        # Torch vectorized normalization (GPU-ready!)
-        normalized = (data_tensor - means.unsqueeze(1)) / (stds.unsqueeze(1) + 1e-8)
+        if modality == 'evap':
+            # Evaporation: Direct global normalization
+            mean = self.stats['evap_mean']  # Scalar
+            std = self.stats['evap_std']    # Scalar
+            normalized = (data_tensor - mean) / (std + 1e-8)
+
+        elif modality == 'riverflow':
+            # Riverflow: Log transform + global normalization
+            # IMPORTANT: Handle NaN values (from 1970-1988 missing period)
+            eps = 1e-6
+            # Create mask for NaN values
+            nan_mask = torch.isnan(data_tensor)
+            # Replace NaN with 0 temporarily for log transform
+            data_safe = torch.where(nan_mask, torch.zeros_like(data_tensor), data_tensor)
+            # Apply log transform
+            data_log = torch.log(data_safe + eps)
+            mean = self.stats['riverflow_log_mean']  # Scalar
+            std = self.stats['riverflow_log_std']    # Scalar
+            normalized = (data_log - mean) / (std + 1e-8)
+            # Restore NaN values (will be masked later)
+            normalized = torch.where(nan_mask, torch.full_like(normalized, float('nan')), normalized)
+
+        else:
+            raise ValueError(f"Unknown modality: {modality}")
 
         return normalized
 
@@ -502,10 +559,17 @@ class MultiModalHydroDatasetOptimized(Dataset):
                 'num_patches': int,
                 'patch_size': int,
                 'start_date': datetime,
+                'riverflow_missing': bool,  # NEW: whether riverflow data is available
             }
         """
         start_day_idx = self.valid_samples[idx]
         end_day_idx = start_day_idx + self.max_sequence_length
+
+        # NEW: Get start date and check if riverflow is available for the ENTIRE window
+        start_date = self.date_list[start_day_idx]
+        end_date = self.date_list[end_day_idx - 1]  # Last day in the window
+        # Riverflow is missing if ANY day in the window is before riverflow_available_from
+        riverflow_missing = (end_date < self.riverflow_available_from)
 
         # 1. Image data: Direct slicing (super fast!)
         precip_seq = self.image_data['precip'][start_day_idx:end_day_idx]
@@ -561,10 +625,11 @@ class MultiModalHydroDatasetOptimized(Dataset):
             'soil': soil_norm,
             'temp': temp_norm,
             'evap': evap_patches,
-            'riverflow': riverflow_patches,
+            'riverflow': riverflow_patches,  # Still returned even if missing (will be masked)
             'static_attr': static_patches,
             'catchment_padding_mask': padding_mask,
             'num_patches': self.num_patches,
             'patch_size': self.patch_size,
-            'start_date': self.date_list[start_day_idx],
+            'start_date': start_date,  # Already computed above
+            'riverflow_missing': riverflow_missing,  # NEW: flag for riverflow availability
         }

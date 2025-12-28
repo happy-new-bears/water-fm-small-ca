@@ -48,10 +48,7 @@ class MAEConfig:
     data_root = '/Users/transformer/Desktop/water_data/new_version'
     #data_root = '../../new_version'
 
-    # Data paths (relative to data_root)
-    precip_dir = f'{data_root}/precipitation_processed'
-    soil_dir = f'{data_root}/soil_moisture_processed'
-    temp_dir = f'{data_root}/temperature_processed'
+    # Data paths
     vector_file = f'{data_root}/riverflow_evaporation_604catchments_1970_2015.parquet'
     static_attr_file = f'{data_root}/Catchment_attributes/Catchment_attributes_nrfa.csv'
     land_mask_path = f'{data_root}/gb_temp_valid_mask_290x180.pt'
@@ -66,20 +63,23 @@ class MAEConfig:
     ]
 
     # Time periods
-    train_start = '1989-01-01'
+    train_start = '1970-01-01'  # Extended to 1970 (riverflow missing 1970-1988)
     train_end = '2010-12-31'
     val_start = '2011-01-01'
     val_end = '2015-12-30'  # Data ends on 2015-12-30, not 2015-12-31
 
+    # Riverflow data availability
+    riverflow_available_from = '1989-01-01'  # Riverflow data starts from 1989
+
     # Dataset settings
     stride = 20  # Stride for sliding window sampling (days)
-    stats_cache_path = 'cache/normalization_stats.pt'
+    stats_cache_path = 'cache/normalization_stats_1970_2015.pt'  # Updated cache name
 
     # ========== Merged H5 Files (优化后) ==========
-    # Training period h5 files
-    precip_train_h5 = f'{data_root}/precipitation_train_1989_2010.h5'
-    soil_train_h5 = f'{data_root}/soil_moisture_train_1989_2010.h5'
-    temp_train_h5 = f'{data_root}/temperature_train_1989_2010.h5'
+    # Training period h5 files (complete 1970-2010)
+    precip_train_h5 = f'{data_root}/precipitation_train_1970_2010.h5'
+    soil_train_h5 = f'{data_root}/soil_moisture_train_1970_2010.h5'
+    temp_train_h5 = f'{data_root}/temperature_train_1970_2010.h5'
 
     # Validation period h5 files
     precip_val_h5 = f'{data_root}/precipitation_val_2011_2015.h5'

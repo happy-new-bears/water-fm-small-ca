@@ -25,6 +25,7 @@ import importlib.util
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import deepspeed as ds
@@ -165,18 +166,40 @@ def create_datasets(config, rank):
         print("Loading vector data...")
         print("=" * 60)
 
-    # Load vector data
-    vector_data, time_vec, catchment_ids, var_names = load_vector_data_from_parquet(
+    # Load evaporation data (full time range: 1970-2015)
+    evap_vector_data, time_vec, catchment_ids, _ = load_vector_data_from_parquet(
         config.vector_file,
-        variables=['evaporation', 'discharge_vol'],
-        start=datetime.strptime(config.train_start, '%Y-%m-%d'),
-        end=datetime.strptime(config.val_end, '%Y-%m-%d'),  # Load all data
+        variables=['evaporation'],
+        start=datetime.strptime(config.train_start, '%Y-%m-%d'),  # 1970-01-01
+        end=datetime.strptime(config.val_end, '%Y-%m-%d'),         # 2015-12-30
         nan_ratio=0.05,
     )
+    evap_data = evap_vector_data[:, :, 0].T  # [num_catchments, num_days]
 
-    # Extract modalities
-    evap_data = vector_data[:, :, 0].T  # [num_catchments, num_days]
-    riverflow_data = vector_data[:, :, 1].T
+    # Load riverflow data (only from 1989 onwards)
+    riverflow_start = config.riverflow_available_from if hasattr(config, 'riverflow_available_from') else '1989-01-01'
+    riverflow_vector_data, time_vec_river, catchment_ids_river, _ = load_vector_data_from_parquet(
+        config.vector_file,
+        variables=['discharge_vol'],
+        start=datetime.strptime(riverflow_start, '%Y-%m-%d'),     # 1989-01-01
+        end=datetime.strptime(config.val_end, '%Y-%m-%d'),         # 2015-12-30
+        nan_ratio=0.05,
+    )
+    riverflow_data_partial = riverflow_vector_data[:, :, 0].T  # [num_catchments, num_days_from_1989]
+
+    # Check catchment IDs match
+    if not np.array_equal(catchment_ids, catchment_ids_river):
+        raise ValueError("Catchment IDs mismatch between evaporation and riverflow!")
+
+    # Pad riverflow data with NaN for the 1970-1988 period
+    num_missing_days = len(time_vec) - len(time_vec_river)
+    riverflow_data = np.full((riverflow_data_partial.shape[0], len(time_vec)), np.nan, dtype=np.float32)
+    riverflow_data[:, num_missing_days:] = riverflow_data_partial
+
+    if rank == 0:
+        print(f"✓ Riverflow data padded: {riverflow_data.shape}")
+        print(f"  - Missing period (1970-1988): {num_missing_days} days filled with NaN")
+        print(f"  - Valid period (1989-2015): {len(time_vec_river)} days with real data")
 
     if rank == 0:
         print(f"✓ Vector data loaded: {evap_data.shape}")
@@ -240,6 +263,8 @@ def create_datasets(config, rank):
         split='train',
         # Performance optimization
         cache_to_memory=config.cache_images_to_memory if hasattr(config, 'cache_images_to_memory') else True,
+        # NEW: Riverflow availability
+        riverflow_available_from=config.riverflow_available_from if hasattr(config, 'riverflow_available_from') else '1989-01-01',
     )
 
     # Validation dataset
@@ -269,6 +294,8 @@ def create_datasets(config, rank):
         split='val',
         # Performance optimization
         cache_to_memory=config.cache_images_to_memory if hasattr(config, 'cache_images_to_memory') else True,
+        # NEW: Riverflow availability
+        riverflow_available_from=config.riverflow_available_from if hasattr(config, 'riverflow_available_from') else '1989-01-01',
     )
 
     if rank == 0:
@@ -696,17 +723,22 @@ def main():
             if std < 1e-6:
                 print(f"    ⚠️  WARNING: Very small std ({std:.2e})")
 
-        # Vector modalities (per-catchment mean/std)
-        print(f"\n📊 VECTOR MODALITIES:")
-        for modality in ['evap', 'riverflow']:
-            mean_vec = stats[f'{modality}_mean']  # [num_catchments]
-            std_vec = stats[f'{modality}_std']    # [num_catchments]
+        # Vector modalities (global mean/std)
+        print(f"\n📊 VECTOR MODALITIES (Global Normalization):")
 
-            print(f"\n  {modality.upper()} (604 catchments):")
-            print(f"    Mean range: [{mean_vec.min().item():10.4f}, {mean_vec.max().item():10.4f}]")
-            print(f"    Std range:  [{std_vec.min().item():10.4f}, {std_vec.max().item():10.4f}]")
-            print(f"    Mean of means: {mean_vec.mean().item():10.4f}")
-            print(f"    Mean of stds:  {std_vec.mean().item():10.4f}")
+        # Evaporation
+        evap_mean = stats['evap_mean']  # Scalar
+        evap_std = stats['evap_std']    # Scalar
+        print(f"\n  EVAP:")
+        print(f"    Global mean: {evap_mean.item():10.4f}")
+        print(f"    Global std:  {evap_std.item():10.4f}")
+
+        # Riverflow (log-transformed)
+        riverflow_log_mean = stats['riverflow_log_mean']  # Scalar
+        riverflow_log_std = stats['riverflow_log_std']    # Scalar
+        print(f"\n  RIVERFLOW (log-transformed):")
+        print(f"    Log mean: {riverflow_log_mean.item():10.4f}")
+        print(f"    Log std:  {riverflow_log_std.item():10.4f}")
 
         # Static attributes
         print(f"\n📊 STATIC ATTRIBUTES ({len(config.static_attrs)} features):")
