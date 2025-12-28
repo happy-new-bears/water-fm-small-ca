@@ -262,6 +262,11 @@ class CrossAttention(nn.Module):
             attn = attn.masked_fill(attn_mask, float('-inf'))
 
         attn = attn.softmax(dim=-1)
+
+        # Handle NaN from all-masked rows (when all keys are padded)
+        # This can happen in extreme cases, replace NaN with 0
+        attn = torch.nan_to_num(attn, nan=0.0)
+
         attn = self.attn_drop(attn)
 
         # Apply attention to values
